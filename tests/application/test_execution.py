@@ -17,16 +17,29 @@ from free_claude_code.application.routing import (
 )
 from free_claude_code.config.reasoning import ReasoningPreference
 from free_claude_code.core.anthropic.models import Message, MessagesRequest
+from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
 from free_claude_code.core.async_iterators import AsyncCloseable
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningCapability, ReasoningPolicy
+from free_claude_code.core.stream_recovery import ContinuationSeed
 
 
 class FakeProvider:
     def __init__(self) -> None:
         self.stream_calls: list[dict[str, object]] = []
         self.stream_close_calls = 0
+
+    def stream_native_messages(
+        self,
+        request: NativeMessagesRequest,
+        *,
+        request_id: str,
+        response_model: str,
+        request_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[str]:
+        raise AssertionError("Compatibility test provider received a native request")
 
     async def stream_messages(
         self,
@@ -38,6 +51,7 @@ class FakeProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self._record_stream_call(
             request,
@@ -60,6 +74,8 @@ class FakeProvider:
         response_model: str,
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         raise AssertionError("Messages test provider received a Responses request")
         yield ""
@@ -99,6 +115,7 @@ class ResponsesFakeProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         raise AssertionError("Responses test provider received a Messages request")
         yield ""
@@ -112,6 +129,8 @@ class ResponsesFakeProvider:
         response_model: str,
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self.stream_calls.append(
             {
@@ -164,6 +183,7 @@ class ControlledProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self._record_stream_call(
             request,
@@ -231,6 +251,7 @@ class FailingStreamConstructionProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         raise RuntimeError("stream construction failed")
 
@@ -250,6 +271,7 @@ class ExecutionFailureStreamConstructionProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         del request, input_tokens, request_id, response_model, reasoning
         raise self._failure
@@ -279,6 +301,7 @@ class CloseControlledProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self._record_stream_call(
             request,
@@ -334,8 +357,13 @@ def _routed_request(
 
 
 @pytest.mark.asyncio
-async def test_fallback_receives_its_own_cached_capability_in_stream():
+@pytest.mark.parametrize("ingress", ["messages", "responses"])
+@pytest.mark.parametrize("unknown_fallback", [False, True])
+async def test_fallback_receives_its_own_cached_capability_in_stream(
+    ingress, unknown_fallback
+):
     seen = []
+    resolved = set()
 
     class MetadataProvider(ControlledProvider):
         async def stream_messages(self, request, input_tokens=0, **kwargs):
@@ -343,34 +371,46 @@ async def test_fallback_receives_its_own_cached_capability_in_stream():
             async for event in super().stream_messages(request, input_tokens, **kwargs):
                 yield event
 
+        stream_responses = stream_messages
+
     primary_info = ProviderModelInfo(
         "provider/provider-model", reasoning_capability=ReasoningCapability.NONE
     )
-    fallback_info = ProviderModelInfo(
-        "fallback/fallback-model", reasoning_capability=ReasoningCapability.REQUIRED
+    fallback_info = (
+        ProviderModelInfo(
+            "fallback/fallback-model", reasoning_capability=ReasoningCapability.REQUIRED
+        )
+        if not unknown_fallback
+        else None
     )
     primary = MetadataProvider(
         [ExecutionFailure(FailureKind.UNAVAILABLE, 503, "unavailable", True)]
     )
     fallback = MetadataProvider(["verdict"])
     providers = {"provider": primary, "fallback": fallback}
+
+    async def resolve(name):
+        resolved.add(name)
+        return providers[name]
+
+    def lookup(provider_id, model_id):
+        assert provider_id in resolved
+        return {
+            "provider/provider-model": primary_info,
+            "fallback/fallback-model": fallback_info,
+        }.get(f"{provider_id}/{model_id}")
+
     executor = ProviderExecutor(
-        AsyncMock(side_effect=lambda name: providers[name]),
+        resolve,
         progress_timeout_seconds=10,
-        model_info_lookup=lambda provider_id, model_id: next(
-            (
-                info
-                for info in (primary_info, fallback_info)
-                if info.model_id == f"{provider_id}/{model_id}"
-            ),
-            None,
-        ),
+        model_info_lookup=lookup,
     )
+    route = _routed_request if ingress == "messages" else _routed_responses_request
     output = [
         event
-        async for event in executor.stream_messages(
-            _routed_request(_target("fallback", "fallback-model")),
-            raw_log_payload={},
+        async for event in getattr(executor, f"stream_{ingress}")(
+            route(_target("fallback", "fallback-model")),
+            raw_log_payload=dict,
             request_id="capability-fallback",
         )
     ]
@@ -414,7 +454,7 @@ def _executor_stream(
     )
     return executor.stream_messages(
         _routed_request(),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id=request_id,
     )
 
@@ -432,7 +472,7 @@ async def test_executor_routes_native_responses_without_messages_conversion() ->
 
     stream = executor.stream_responses(
         routed,
-        raw_log_payload=request.model_dump(mode="json"),
+        raw_log_payload=lambda: request.model_dump(mode="json"),
         request_id="req_responses_application",
     )
 
@@ -467,7 +507,7 @@ async def test_executor_uses_structural_provider_port_and_defers_stream_startup(
 
     stream = executor.stream_messages(
         routed,
-        raw_log_payload=request.model_dump(),
+        raw_log_payload=request.model_dump,
         request_id="req_application",
     )
 
@@ -511,7 +551,7 @@ async def test_primary_success_never_resolves_fallback() -> None:
     executor = ProviderExecutor(resolve, progress_timeout_seconds=60.0)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "fallback-model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_primary_success",
     )
 
@@ -547,7 +587,7 @@ async def test_retryable_preframe_failure_selects_fallback_after_closing_primary
             chunk
             async for chunk in executor.stream_messages(
                 routed,
-                raw_log_payload={},
+                raw_log_payload=dict,
                 request_id="req_fallback",
             )
         ]
@@ -585,6 +625,8 @@ async def test_retryable_preframe_failure_selects_fallback_after_closing_primary
         "failure_kind": "overloaded",
         "status_code": 529,
         "provider_retryable": True,
+        "recovery_action": "restart",
+        "recovery_reason": "no_candidate_output",
         "generation_id": 7,
     }
     selected = next(
@@ -610,7 +652,7 @@ async def test_fallback_chain_preserves_exact_last_failure() -> None:
     )
     stream = executor.stream_messages(
         _routed_request(_target("second", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_exhausted",
     )
 
@@ -640,7 +682,7 @@ async def test_multiple_retryable_failures_walk_fallbacks_in_order() -> None:
             _target("second", "second-model"),
             _target("third", "third-model"),
         ),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_ordered_fallbacks",
     )
 
@@ -662,7 +704,7 @@ async def test_empty_primary_completion_does_not_select_fallback() -> None:
     executor = ProviderExecutor(resolve, progress_timeout_seconds=60.0)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_empty_primary",
     )
 
@@ -684,7 +726,7 @@ async def test_unexpected_primary_failure_does_not_select_fallback() -> None:
     executor = ProviderExecutor(resolve, progress_timeout_seconds=60.0)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_unexpected_primary",
     )
 
@@ -709,7 +751,7 @@ async def test_invalid_none_stream_remains_terminal() -> None:
     with patch.object(primary, "stream_messages", return_value=None):
         stream = executor.stream_messages(
             _routed_request(_target("fallback", "model")),
-            raw_log_payload={},
+            raw_log_payload=dict,
             request_id="req_invalid_stream",
         )
         with pytest.raises(TypeError):
@@ -741,7 +783,7 @@ async def test_nonretryable_provider_failure_selects_fallback_before_first_frame
     executor = ProviderExecutor(resolve, progress_timeout_seconds=60.0)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_rejected",
     )
 
@@ -777,7 +819,7 @@ async def test_primary_canonical_startup_failure_selects_fallback() -> None:
 
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "fallback-model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_startup_fallback",
     )
 
@@ -805,7 +847,7 @@ async def test_nonretryable_stream_construction_failure_selects_fallback() -> No
     )
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_construction_failure",
     )
 
@@ -827,7 +869,7 @@ async def test_failure_after_first_frame_never_selects_fallback() -> None:
     executor = ProviderExecutor(resolve, progress_timeout_seconds=60.0)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_committed",
     )
 
@@ -851,7 +893,7 @@ async def test_lazy_fallback_startup_application_error_stops_unchanged() -> None
     )
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_startup",
     )
 
@@ -876,6 +918,7 @@ async def test_candidate_requests_are_isolated_from_provider_mutation() -> None:
             reasoning: ReasoningPolicy,
             request_headers: Mapping[str, str] | None = None,
             model_info: ProviderModelInfo | None = None,
+            continuation: ContinuationSeed | None = None,
         ) -> AsyncIterator[str]:
             request.messages[0].content = "mutated"
             async for chunk in super().stream_messages(
@@ -900,7 +943,7 @@ async def test_candidate_requests_are_isolated_from_provider_mutation() -> None:
         chunk
         async for chunk in executor.stream_messages(
             routed,
-            raw_log_payload={},
+            raw_log_payload=dict,
             request_id="req_isolated",
         )
     ]
@@ -921,7 +964,7 @@ async def test_closing_executor_stream_closes_provider_stream_once() -> None:
     )
     stream = executor.stream_messages(
         routed,
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_early_close",
     )
 
@@ -950,7 +993,7 @@ async def test_stream_construction_failure_remains_deferred_to_iteration() -> No
 
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_deferred_construction",
     )
 
@@ -972,7 +1015,7 @@ async def test_executor_validation_is_deferred_until_iteration() -> None:
 
     stream = executor.stream_messages(
         _routed_request(),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_application",
     )
     token_counter.assert_called_once()
@@ -1048,7 +1091,7 @@ async def test_application_progress_timeout_never_resolves_fallback() -> None:
     executor = ProviderExecutor(resolve, progress_timeout_seconds=0.02)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_terminal_progress_timeout",
     )
 
@@ -1079,7 +1122,7 @@ async def test_provider_cleanup_cannot_delay_fallback_past_progress_deadline() -
     executor = ProviderExecutor(resolve, progress_timeout_seconds=0.02)
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_cleanup_timeout",
     )
 
@@ -1101,7 +1144,7 @@ async def test_provider_cleanup_cannot_delay_fallback_past_progress_deadline() -
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_trace_names_preserved_provider_failure() -> None:
+async def test_cleanup_warning_names_preserved_provider_failure(caplog) -> None:
     failure = _execution_failure("primary overloaded")
     provider = CloseControlledProvider(
         failure,
@@ -1113,20 +1156,16 @@ async def test_cleanup_failure_trace_names_preserved_provider_failure() -> None:
         request_id="req_close_failure_trace",
     )
 
-    with (
-        patch("free_claude_code.core.trace.trace_event") as trace_mock,
-        pytest.raises(ExecutionFailure) as exc_info,
-    ):
+    with pytest.raises(ExecutionFailure) as exc_info:
         await anext(stream)
 
     assert exc_info.value is failure
-    close_trace = next(
-        call.kwargs
-        for call in trace_mock.call_args_list
-        if call.kwargs.get("event") == "stream.input.close_failed"
-    )
-    assert close_trace["close_exc_type"] == "RuntimeError"
-    assert close_trace["preserved_exc_type"] == "ExecutionFailure"
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert warnings[0].extra["event"] == "stream.input.close_failed"
+    assert warnings[0].extra["close_exc_type"] == "RuntimeError"
+    assert warnings[0].extra["preserved_exc_type"] == "ExecutionFailure"
+    assert str(warnings[0].exc_info[1]) == "close failed"
 
 
 @pytest.mark.asyncio
@@ -1184,7 +1223,7 @@ async def test_fallback_transition_does_not_reset_shared_progress_deadline() -> 
     )
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_shared_deadline",
     )
     deadlines: list[float | None] = []
@@ -1262,7 +1301,7 @@ async def test_cancelling_progress_wait_remains_cancellation() -> None:
     )
     stream = executor.stream_messages(
         _routed_request(_target("fallback", "model")),
-        raw_log_payload={},
+        raw_log_payload=dict,
         request_id="req_cancelled_progress",
     )
     task = asyncio.ensure_future(anext(stream))

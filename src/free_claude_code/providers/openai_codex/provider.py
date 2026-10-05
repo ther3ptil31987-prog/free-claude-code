@@ -9,11 +9,13 @@ from typing import Any
 
 import httpx2
 from openai import AsyncOpenAI
+from packaging.version import Version
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
     ProviderOperationKind,
@@ -126,7 +128,9 @@ class OpenAICodexProvider(BaseProvider):
                     payload = await client.get(
                         "models",
                         cast_to=object,
-                        options={"params": {"client_version": FCC_VERSION}},
+                        options={
+                            "params": {"client_version": _model_list_client_version()}
+                        },
                     )
                     await attempt.accept()
                     execution.succeed()
@@ -167,6 +171,7 @@ class OpenAICodexProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         return self._responses.stream_messages(
             request,
@@ -176,6 +181,7 @@ class OpenAICodexProvider(BaseProvider):
             reasoning=reasoning,
             endpoint_context=self._endpoint(session_id=str(uuid.uuid4())),
             model_info=model_info,
+            continuation=continuation,
         )
 
     def stream_responses(
@@ -187,6 +193,8 @@ class OpenAICodexProvider(BaseProvider):
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         return self._responses.stream_responses(
             request,
@@ -195,7 +203,21 @@ class OpenAICodexProvider(BaseProvider):
             response_model=response_model or request.model,
             reasoning=reasoning,
             endpoint_context=self._endpoint(session_id=str(uuid.uuid4())),
+            continuation=continuation,
         )
+
+
+def _model_list_client_version() -> str:
+    """Format FCC's release and VCS development versions for the catalog API."""
+    if FCC_VERSION == "dev":
+        return "0.0.0-dev"
+    parsed = Version(FCC_VERSION)
+    formatted = f"{parsed.major}.{parsed.minor}.{parsed.micro}"
+    if parsed.dev is not None:
+        formatted += f"-dev.{parsed.dev}"
+    if parsed.local is not None:
+        formatted += f"+{parsed.local}"
+    return formatted
 
 
 async def _endpoint_required() -> str:

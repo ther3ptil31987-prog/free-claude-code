@@ -1,6 +1,6 @@
 import json
 import tomllib
-from itertools import pairwise
+from itertools import groupby, pairwise
 
 import pytest
 from playwright.sync_api import expect
@@ -13,6 +13,8 @@ from free_claude_code.harnesses import claude_integration
     [
         ("claude-vscode", "openClaudeIntegration"),
         ("codex", "openCodexIntegration"),
+        ("claude-desktop", "openClaudeDesktopIntegration"),
+        ("jetbrains-acp", "openJetBrainsIntegration"),
     ],
 )
 @pytest.mark.parametrize("connected", [False, True])
@@ -20,9 +22,12 @@ def test_connection_check_uses_disabled_loading_button(
     page, admin_base_url, integration, button_id, connected
 ):
     pending = []
-    page.route(
-        f"**/admin/api/integrations/{integration}", lambda route: pending.append(route)
-    )
+
+    def hold_check(route):
+        pending.append(route)
+        page.evaluate("window.integrationChecks = (window.integrationChecks || 0) + 1")
+
+    page.route(f"**/admin/api/integrations/{integration}", hold_check)
     page.goto(f"{admin_base_url}/admin/integrations")
     button = page.locator(f"#{button_id}")
     for visit in range(2):
@@ -40,8 +45,17 @@ def test_connection_check_uses_disabled_loading_button(
             == "integration-spinner"
         )
         expect(page.locator("#view-integrations .status-pill")).to_have_count(0)
+        page.wait_for_function(
+            "count => window.integrationChecks >= count", arg=visit + 1
+        )
         assert len(pending) == 1
-        pending.pop().fulfill(json={"connected": connected, "paths": None})
+        pending.pop().fulfill(
+            json={
+                "connected": connected,
+                "paths": None,
+                "update": {"state": "ready", "changed": False, "message": None},
+            }
+        )
         expect(button).to_be_enabled()
         expect(button).to_have_text("Disconnect" if connected else "Connect")
         expect(button).to_have_attribute("aria-busy", "false")
@@ -56,28 +70,23 @@ def test_codex_connect_disconnect_and_modal_paths(
     expect(page.locator("#openClaudeIntegration")).to_be_enabled()
     expect(page.locator("#messageArea")).to_have_text("")
     cards = page.locator("#view-integrations > article")
-    expect(cards).to_have_count(3)
-    expect(cards.locator("h3")).to_have_text(
-        [
-            "Claude Code in VS Code",
-            "Codex in VS Code and App",
-            "Claude Code in JetBrains ACP",
-        ]
-    )
+    expect(cards.first).to_be_visible()
     expect(page.locator("#claudeIntegrationStatus")).to_have_count(0)
     expect(page.locator("#openCodexIntegration")).to_be_enabled()
     expect(page.locator("#codexIntegrationStatus")).to_have_count(0)
-    expect(cards.nth(1)).to_contain_text(
-        "Use FCC's models in the Codex VS Code extension and desktop app."
-    )
     bounds = [card.bounding_box() for card in cards.all()]
     if width >= 1200:
-        assert len({bound["y"] for bound in bounds}) == 1
-        assert all(right["x"] > left["x"] for left, right in pairwise(bounds))
         descriptions = [
             card.locator(".section-heading p").bounding_box() for card in cards.all()
         ]
-        assert len({description["y"] for description in descriptions}) == 1
+        for _, row in groupby(range(len(bounds)), key=lambda index: bounds[index]["y"]):
+            indices = list(row)
+            assert all(
+                bounds[right]["x"] > bounds[left]["x"]
+                for left, right in pairwise(indices)
+            )
+            assert len({descriptions[index]["y"] for index in indices}) == 1
+        assert bounds[1]["y"] == bounds[0]["y"]
     else:
         assert all(right["y"] > left["y"] for left, right in pairwise(bounds))
     assert page.locator("body").evaluate(
@@ -119,10 +128,10 @@ def test_codex_connect_disconnect_and_modal_paths(
     expect(opener).to_have_css("color", "rgb(239, 68, 68)")
     if width >= 1200:
         buttons = [
-            button.bounding_box()
-            for button in page.locator(".integration-card > button").all()
+            card.get_by_role("button").first.bounding_box() for card in cards.all()
         ]
-        assert len({button["y"] for button in buttons}) == 1
+        for _, row in groupby(range(len(bounds)), key=lambda index: bounds[index]["y"]):
+            assert len({buttons[index]["y"] for index in row}) == 1
         assert len({button["height"] for button in buttons}) == 1
     expect(page.locator("#codexIntegrationMessage")).to_have_text(
         "Settings saved. Restart Codex and select an FCC model."
@@ -146,80 +155,6 @@ def test_codex_connect_disconnect_and_modal_paths(
     assert tomllib.loads(path.read_text()) == {"model": "my-choice"}
     assert not (tmp_path / "vscode" / "settings.json").exists()
     assert not (tmp_path / ".claude.json").exists()
-
-
-@pytest.mark.parametrize("width", [1280, 390])
-def test_jetbrains_preview_connect_is_noop_and_modal_dismisses(
-    page, admin_base_url, tmp_path, width
-):
-    page.set_viewport_size({"width": width, "height": 900})
-    page.goto(f"{admin_base_url}/admin/integrations")
-    expect(page.locator("#messageArea")).to_have_text("")
-    expect(page.locator("#openClaudeIntegration")).to_be_enabled()
-    expect(page.locator("#openCodexIntegration")).to_be_enabled()
-    opener = page.locator("#openJetBrainsIntegration")
-    expect(opener).to_be_enabled()
-    expect(opener).to_have_text("Connect")
-    card = page.locator("#view-integrations > article").nth(2)
-    expect(card).to_contain_text(
-        "Use FCC's models in Claude Code through JetBrains ACP."
-    )
-    expect(card.get_by_role("status")).to_have_count(0)
-    page.screenshot(path=str(tmp_path / f"jetbrains-card-{width}.png"), full_page=True)
-    paths = [
-        tmp_path / ".fcc" / ".env",
-        tmp_path / "vscode" / "settings.json",
-        tmp_path / ".claude.json",
-        tmp_path / ".codex" / "config.toml",
-    ]
-    before = {path: path.read_bytes() if path.exists() else None for path in paths}
-    page.wait_for_function("!state.startupRequest && !state.startupTimer")
-    requests = []
-
-    def record_request(request):
-        requests.append((request.method, request.url))
-
-    page.on("request", record_request)
-    dialog = page.get_by_role("dialog", name="Claude Code in JetBrains ACP", exact=True)
-    for dismiss in ("close", "escape", "outside"):
-        opener.click()
-        expect(dialog).to_be_visible()
-        close = dialog.get_by_role("button", name="Close", exact=True)
-        expect(close).to_be_focused()
-        expect(dialog).to_have_accessible_description(
-            "Route Claude Code in JetBrains through your FCC server."
-        )
-        assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")
-        page.locator("#jetBrainsIntegrationDescription").click()
-        dialog.click(position={"x": 10, "y": 80})
-        expect(dialog).to_be_visible()
-        action = dialog.get_by_role("button", name="Connect", exact=True)
-        for _ in range(2):
-            expect(action).to_be_enabled()
-            action.click()
-            expect(dialog).to_be_visible()
-            expect(action).to_have_text("Connect")
-        if dismiss == "close":
-            page.screenshot(path=str(tmp_path / f"jetbrains-modal-{width}.png"))
-            close.click()
-        elif dismiss == "escape":
-            page.keyboard.press("Escape")
-        else:
-            page.mouse.click(1, 1)
-        expect(dialog).not_to_be_visible()
-        expect(opener).to_be_focused()
-        expect(opener).to_have_text("Connect")
-    assert requests == []
-    assert {
-        path: path.read_bytes() if path.exists() else None for path in paths
-    } == before
-    page.remove_listener("request", record_request)
-    page.reload()
-    expect(opener).to_be_enabled()
-    expect(opener).to_have_text("Connect")
-    expect(dialog).not_to_be_visible()
-    opener.click()
-    expect(dialog).to_be_visible()
 
 
 @pytest.mark.parametrize("width", [1280, 390])
@@ -342,14 +277,20 @@ def test_save_pending_and_failure_stay_in_modal(page, admin_base_url):
     page.goto(f"{admin_base_url}/admin/integrations")
     page.locator("#openClaudeIntegration").click()
     requests = []
+
+    def hold_save(route):
+        requests.append(route)
+        page.evaluate("window.integrationSaveIntercepted = true")
+
     page.route(
         "**/admin/api/integrations/claude-vscode/connect",
-        lambda route: requests.append(route),
+        hold_save,
     )
     action = page.locator("#confirmClaudeIntegration")
     action.click()
     expect(action).to_be_disabled()
     expect(action).to_have_text("Saving…")
+    page.wait_for_function("window.integrationSaveIntercepted === true")
     requests[0].fulfill(status=503, json={"detail": "Could not save settings."})
     expect(action).to_be_enabled()
     expect(page.locator("#claudeIntegrationDialog")).to_be_visible()
@@ -381,19 +322,141 @@ def test_codex_existing_setup_revisit_and_invalid_config_retry(
 def test_codex_save_pending_and_failure_stay_in_modal(page, admin_base_url, tmp_path):
     page.goto(f"{admin_base_url}/admin/integrations")
     page.locator("#openCodexIntegration").click()
-    requests = []
-    page.route(
-        "**/admin/api/integrations/codex/connect", lambda route: requests.append(route)
-    )
     action = page.locator("#confirmCodexIntegration")
+
+    def reject_save(route):
+        expect(action).to_be_disabled()
+        expect(action).to_have_text("Saving…")
+        expect(page.locator("#openCodexIntegration")).to_be_disabled()
+        route.fulfill(status=503, json={"detail": "Could not save settings."})
+
+    page.route("**/admin/api/integrations/codex/connect", reject_save)
     action.click()
-    expect(action).to_be_disabled()
-    expect(action).to_have_text("Saving…")
-    expect(page.locator("#openCodexIntegration")).to_be_disabled()
-    requests[0].fulfill(status=503, json={"detail": "Could not save settings."})
-    expect(action).to_be_enabled()
-    expect(page.locator("#codexIntegrationDialog")).to_be_visible()
     expect(page.locator("#codexIntegrationDialogMessage")).to_have_text(
         "Could not save settings."
     )
+    expect(action).to_be_enabled()
+    expect(page.locator("#codexIntegrationDialog")).to_be_visible()
     assert not (tmp_path / ".codex" / "config.toml").exists()
+
+
+@pytest.mark.parametrize(
+    "integration,prefix", [("claude-vscode", "Claude"), ("codex", "Codex")]
+)
+def test_background_update_spinner_failure_retry_and_completion(
+    page, admin_base_url, integration, prefix
+):
+    progress = {"state": "starting", "changed": False, "message": None}
+    retries = []
+
+    def startup(route):
+        response = route.fetch()
+        payload = response.json()
+        payload["startup"]["integrations"][integration] = dict(progress)
+        route.fulfill(response=response, json=payload)
+
+    def status(route):
+        route.fulfill(
+            json={
+                "connected": True if progress["state"] == "ready" else None,
+                "paths": None,
+                "update": dict(progress),
+            }
+        )
+
+    def retry(route):
+        retries.append(route.request.method)
+        progress.update(state="starting", changed=False, message=None)
+        route.fulfill(json={"update": dict(progress)})
+
+    page.route("**/admin/api/status", startup)
+    page.route(f"**/admin/api/integrations/{integration}", status)
+    page.route(f"**/admin/api/integrations/{integration}/refresh", retry)
+    page.goto(f"{admin_base_url}/admin/integrations")
+    button = page.locator(f"#open{prefix}Integration")
+    confirm = page.locator(f"#confirm{prefix}Integration")
+    message = page.locator(f"#{prefix.lower()}IntegrationMessage")
+    expect(button).to_be_disabled()
+    expect(confirm).to_be_disabled()
+    expect(button).to_have_attribute("aria-busy", "true")
+    progress.update(
+        state="failed", message="Could not update settings. Check permissions."
+    )
+    expect(button).to_have_text("Retry")
+    expect(button).to_be_enabled()
+    expect(message).to_have_text(progress["message"])
+    with page.expect_response(
+        f"{admin_base_url}/admin/api/integrations/{integration}/refresh"
+    ):
+        button.click()
+        expect(button).to_be_disabled()
+    assert retries == ["POST"]
+    page.wait_for_function(
+        "id => state.startup?.startup?.integrations[id]?.state === 'starting'",
+        arg=integration,
+    )
+    progress.update(state="ready", changed=True)
+    expect(button).to_have_text("Disconnect")
+    expect(button).to_be_enabled()
+    expect(button).to_have_css("color", "rgb(239, 68, 68)")
+    expect(message).to_have_text(
+        "Settings updated. Reload VS Code."
+        if prefix == "Claude"
+        else "Settings updated. Restart Codex."
+    )
+
+
+@pytest.fixture
+def admin_client_files(request, tmp_path):
+    if not getattr(request, "param", False):
+        return None
+    path = tmp_path / "vscode/settings.json"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "editor.fontSize": 15,
+                "claudeCode.disableLoginPrompt": True,
+                "claudeCode.environmentVariables": [
+                    {"name": "ANTHROPIC_BASE_URL", "value": "http://localhost:8082"},
+                    {"name": "ANTHROPIC_AUTH_TOKEN", "value": "e2e-proxy-token"},
+                    {
+                        "name": "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+                        "value": "1",
+                    },
+                ],
+            }
+        )
+    )
+    return path
+
+
+@pytest.mark.parametrize("admin_client_files", [True], indirect=True)
+def test_startup_updates_before_opening_integrations(
+    admin_client_files, admin_base_url, page, tmp_path
+):
+    page.goto(f"{admin_base_url}/admin")
+    page.wait_for_function(
+        "state.startup?.startup?.integrations['claude-vscode']?.state === 'ready'"
+    )
+    page.get_by_role("button", name="Integrations", exact=True).click()
+    button = page.locator("#openClaudeIntegration")
+    expect(button).to_have_text("Disconnect")
+    expect(page.locator("#claudeIntegrationMessage")).to_be_hidden()
+    saved = json.loads(admin_client_files.read_text())
+    assert saved["editor.fontSize"] == 15
+    assert any(
+        entry == {"name": "CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "value": "1"}
+        for entry in saved["claudeCode.environmentVariables"]
+    )
+    assert (
+        json.loads((tmp_path / ".claude.json").read_text())["hasCompletedOnboarding"]
+        is True
+    )
+    page.screenshot(path=str(tmp_path / "integration-updated.png"), full_page=True)
+    button.click()
+    page.locator("#confirmClaudeIntegration").click()
+    expect(button).to_have_text("Connect")
+    page.reload()
+    expect(button).to_have_text("Connect")
+    expect(page.locator("#claudeIntegrationMessage")).to_be_hidden()

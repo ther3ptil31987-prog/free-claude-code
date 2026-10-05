@@ -6,10 +6,16 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from free_claude_code.application.model_catalog import ModelCatalog, read_model_catalog
+from free_claude_code.application.model_catalog import (
+    ModelCatalog,
+    context_window_for_client,
+    read_model_catalog,
+)
 from free_claude_code.application.ports import ModelCatalogPort
+from free_claude_code.application.routing import supports_native_messages
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.gateway_model_ids import (
+    desktop_model_id,
     gateway_model_id,
     no_thinking_gateway_model_id,
 )
@@ -24,6 +30,7 @@ class ModelCatalogView(StrEnum):
     """Client-specific projections of the application model inventory."""
 
     CLAUDE = "claude"
+    CLAUDE_DESKTOP = "claude-desktop"
     MESSAGES = "messages"
     RESPONSES = "responses"
 
@@ -72,6 +79,9 @@ class ModelResponse(BaseModel):
     )
     context_window_tokens: int | None = Field(
         default=None, serialization_alias="contextWindow"
+    )
+    context_window_source: Literal["provider", "default"] | None = Field(
+        default=None, serialization_alias="contextWindowSource"
     )
     max_output_tokens: int | None = Field(
         default=None, serialization_alias="maxCompletionTokens"
@@ -146,8 +156,10 @@ def build_models_list_response(
 ) -> ModelsListResponse:
     """Return the application model inventory in the requested client view."""
     catalog = read_model_catalog(runtime, settings)
-    if view is ModelCatalogView.CLAUDE:
-        return _build_claude_models_response(catalog)
+    if view in {ModelCatalogView.CLAUDE, ModelCatalogView.CLAUDE_DESKTOP}:
+        return _build_claude_models_response(
+            catalog, desktop=view is ModelCatalogView.CLAUDE_DESKTOP
+        )
     return _build_direct_models_response(settings, catalog, view=view)
 
 
@@ -178,18 +190,28 @@ def build_muse_models_list_response(
     return catalog
 
 
-def _build_claude_models_response(catalog: ModelCatalog) -> ModelsListResponse:
+def _build_claude_models_response(
+    catalog: ModelCatalog, *, desktop: bool = False
+) -> ModelsListResponse:
     """Keep shortcuts first and provider variants together in catalog order."""
     models = list(SUPPORTED_CLAUDE_MODELS)
     for model in catalog.models:
         ref = model.provider_model_ref
-        if model.supports_reasoning is not False:
+        native = supports_native_messages(ref.partition("/")[0])
+        if native or model.supports_reasoning is not False:
             models.append(
-                _discovered_model_response(gateway_model_id(ref), display_name=ref)
+                _discovered_model_response(
+                    desktop_model_id(ref) if desktop else gateway_model_id(ref),
+                    display_name=ref,
+                )
             )
+        if native:
+            continue
         models.append(
             _discovered_model_response(
-                no_thinking_gateway_model_id(ref),
+                desktop_model_id(ref, no_thinking=True)
+                if desktop
+                else no_thinking_gateway_model_id(ref),
                 display_name=f"{ref} (no thinking)",
             )
         )
@@ -214,12 +236,19 @@ def _build_direct_models_response(
         else None
     )
 
+    default_model_id = catalog.default_model_id
     for model in catalog.models:
+        native = view is ModelCatalogView.MESSAGES and supports_native_messages(
+            model.provider_model_ref.partition("/")[0]
+        )
+        model_id = model.provider_model_ref if native else model.wire_slug
+        if model.wire_slug == catalog.default_model_id:
+            default_model_id = model_id
         allows_reasoning = model.supports_reasoning is not False
         models.append(
             ModelResponse(
-                id=model.wire_slug,
-                display_name=model.display_name,
+                id=model_id,
+                display_name=model.provider_model_ref if native else model.display_name,
                 created_at=DISCOVERED_MODEL_CREATED_AT,
                 provider_model_ref=model.provider_model_ref,
                 api_backend=(
@@ -228,7 +257,11 @@ def _build_direct_models_response(
                 max_retries=0 if view is ModelCatalogView.RESPONSES else None,
                 supports_reasoning=model.supports_reasoning,
                 input_modalities=_serialize_input_modalities(model.input_modalities),
-                context_window_tokens=model.context_window_tokens,
+                context_window_tokens=context_window_for_client(model),
+                context_window_source="provider"
+                if model.context_window_tokens is not None
+                and model.context_window_tokens > 0
+                else "default",
                 max_output_tokens=model.max_output_tokens,
                 supports_reasoning_effort=(
                     allows_reasoning if view is ModelCatalogView.RESPONSES else None
@@ -244,7 +277,7 @@ def _build_direct_models_response(
 
     return ModelsListResponse(
         data=models,
-        default_model_id=catalog.default_model_id,
+        default_model_id=default_model_id,
         first_id=models[0].id if models else None,
         has_more=False,
         last_id=models[-1].id if models else None,

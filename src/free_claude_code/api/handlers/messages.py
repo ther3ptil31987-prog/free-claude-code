@@ -1,6 +1,7 @@
 """Claude Messages API product flow."""
 
 import asyncio
+import sys
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
 
@@ -26,7 +27,11 @@ from free_claude_code.api.response_streams import (
 from free_claude_code.application.errors import ApplicationError
 from free_claude_code.application.execution import ProviderExecutor, TokenCounter
 from free_claude_code.application.ports import ModelInfoLookup, ProviderResolver
-from free_claude_code.application.routing import ModelRouter, RoutedMessagesRequest
+from free_claude_code.application.routing import (
+    ModelRouter,
+    RoutedMessagesRequest,
+    RoutedNativeMessagesRequest,
+)
 from free_claude_code.application.web_tools.ports import WebToolsPort
 from free_claude_code.application.web_tools.service import WebToolService
 from free_claude_code.config.settings import Settings
@@ -42,7 +47,8 @@ from free_claude_code.core.anthropic import (
 from free_claude_code.core.diagnostics import safe_exception_message
 from free_claude_code.core.failures import ExecutionFailure, find_execution_failure
 from free_claude_code.core.reasoning import ReasoningControl, ReasoningPolicy
-from free_claude_code.core.trace import trace_event
+from free_claude_code.core.request_outcomes import record_request_route
+from free_claude_code.core.trace import close_stream_input, trace_event
 
 from .classifier_response import classifier_response
 
@@ -94,6 +100,33 @@ class MessagesHandler:
             token_counter=token_counter,
         )
 
+    async def create_native(
+        self, routed: RoutedNativeMessagesRequest, *, request_id: str
+    ) -> object:
+        body = self._provider_executor.stream_native_messages(
+            routed, request_id=request_id
+        )
+        if routed.request.stream:
+            return await anthropic_sse_streaming_response(
+                body,
+                pre_start_error_response=lambda exc: self._pre_start_error_response(
+                    exc, request_id=request_id
+                ),
+                request_id=request_id,
+            )
+        try:
+            chunks = [chunk async for chunk in body]
+            return Response(content="".join(chunks), media_type="application/json")
+        except (Exception, BaseExceptionGroup) as error:
+            return self._pre_start_error_response(error, request_id=request_id)
+        finally:
+            await close_stream_input(
+                body,
+                owner="native_messages_json",
+                source="api",
+                preserved_error=sys.exception(),
+            )
+
     async def create(
         self, request_data: MessagesRequest, *, request_id: str | None = None
     ) -> object:
@@ -103,6 +136,10 @@ class MessagesHandler:
             require_non_empty_messages(request_data.messages)
             routed = self._model_router.resolve_messages_request(request_data)
             routed = self._apply_message_routing_policies(routed)
+            record_request_route(
+                routed.resolved.primary.provider_id,
+                routed.resolved.primary.provider_model,
+            )
             tool_body = self._web_tools.try_stream_messages(
                 routed, request_id=request_id
             )
@@ -116,18 +153,15 @@ class MessagesHandler:
                 result = _MessagesStreamResult(
                     self._provider_executor.stream_messages(
                         routed,
-                        raw_log_payload=routed.request.model_dump(),
+                        raw_log_payload=routed.request.model_dump,
                         request_id=request_id,
                     )
                 )
-            if routed.reasoning.control is ReasoningControl.PREFER_OFF and isinstance(
-                result, _MessagesStreamResult
-            ):
-                result = _MessagesStreamResult(classifier_response(result.body))
             return await self._to_public_response(
                 result,
                 stream=request_data.stream,
                 request_id=request_id,
+                hide_reasoning=routed.reasoning.control is ReasoningControl.PREFER_OFF,
             )
         except ApplicationError:
             raise
@@ -147,6 +181,7 @@ class MessagesHandler:
         *,
         stream: bool,
         request_id: str,
+        hide_reasoning: bool = False,
     ) -> object:
         if isinstance(result, _MessagesCompleteResult):
             return result.response
@@ -156,7 +191,7 @@ class MessagesHandler:
             # serving that raw here breaks the client SDK's response parse.
             try:
                 message, error, _complete = await aggregate_anthropic_sse_to_message(
-                    result.body
+                    classifier_response(result.body) if hide_reasoning else result.body
                 )
             except GeneratorExit:
                 raise
@@ -207,6 +242,7 @@ class MessagesHandler:
                 exc, request_id=request_id
             ),
             request_id=request_id,
+            hide_reasoning=hide_reasoning,
         )
 
     def _pre_start_error_response(

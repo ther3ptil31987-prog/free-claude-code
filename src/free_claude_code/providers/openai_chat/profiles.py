@@ -97,6 +97,7 @@ class OpenAIModelListing:
     required_null_field: str | None = None
     required_sequence_items: tuple[tuple[str, str], ...] = ()
     exclude_missing_sequence_fields: bool = False
+    optional_sequence_items: tuple[tuple[str, str], ...] = ()
     tags_field: str | None = None
     thinking_tag: str = "reasoning"
     non_thinking_tag: str | None = None
@@ -714,6 +715,68 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "experiential": OpenAIChatProfile(
         _policy(
             "EXPERIENTIAL",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            _LOW_MEDIUM_HIGH,
+            enabled_value="medium",
+        ),
+        model_listing=OpenAIModelListing(path="/models"),
+    ),
+    "cheaperinference": OpenAIChatProfile(
+        _policy(
+            "CHEAPERINFERENCE",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            _LOW_MEDIUM_HIGH,
+            enabled_value="medium",
+        ),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            query_params=(("type", "text"), ("streaming", "true")),
+            required_path_values=((("type",), ("text",)),),
+            context_window_tokens_path=("context_length",),
+            max_output_tokens_path=("max_output_tokens",),
+        ),
+    ),
+    "orcarouter": OpenAIChatProfile(
+        _policy(
+            "ORCAROUTER",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(_LOW_MEDIUM_HIGH, enabled_value="medium"),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            optional_sequence_items=(("supported_endpoint_types", "openai"),),
+        ),
+    ),
+    "xkiro": OpenAIChatProfile(
+        _policy(
+            "XKIRO",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            _ALL_EFFORTS, disabled_value="none", enabled_value="adaptive"
+        ),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            thinking_boolean_path=("capabilities", "reasoning"),
+            fixed_input_modalities=_TEXT_INPUT_MODALITIES,
+            input_modality_boolean_paths=(
+                (ModelInputModality.IMAGE, ("capabilities", "vision")),
+            ),
+            context_window_tokens_path=("context_length",),
+            max_output_tokens_path=("max_output_tokens",),
+        ),
+    ),
+    "opper": OpenAIChatProfile(
+        _policy(
+            "OPPER",
             ReasoningReplayMode.REASONING_CONTENT,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
         ),

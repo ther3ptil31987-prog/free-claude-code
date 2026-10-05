@@ -38,7 +38,9 @@ def test_cli_scripts_are_registered() -> None:
     )
 
     assert pyproject["project"]["scripts"] == {
+        "_fcc-update-check": "free_claude_code.updater.check:main",
         "fcc-server": "free_claude_code.cli.entrypoints:serve",
+        "fcc-doctor": "free_claude_code.cli.entrypoints:doctor",
         "fcc-claude": "free_claude_code.cli.launchers.claude:launch",
         "fcc-codex": "free_claude_code.cli.launchers.codex:launch",
         "fcc-pi": "free_claude_code.cli.launchers.pi:launch",
@@ -114,8 +116,9 @@ def test_explicit_open_admin_waits_for_owned_http_ready():
         open_admin.assert_not_called()
         settings = _launcher_settings()
         supervisor._ready_settings = settings
+        supervisor._ready_instance_id = "ready-instance"
         supervisor.request_open_admin()
-        open_admin.assert_called_once_with(settings, 0)
+        open_admin.assert_called_once_with(settings, 0, "ready-instance")
 
 
 @pytest.mark.parametrize("open_admin_browser", (False, True))
@@ -283,7 +286,7 @@ def test_load_server_settings_leaves_process_owned_invalid_proxy_explicit(
 def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
     from free_claude_code.cli import commands
 
-    settings = _launcher_settings()
+    settings = _launcher_settings(port=0)
     get_settings = MagicMock(side_effect=[settings, settings])
     servers: list[object] = []
     restart_callbacks: list[Callable[[], None]] = []
@@ -294,6 +297,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
         restart_callbacks.append(restart_callback)
         app = SimpleNamespace(
             runtime=SimpleNamespace(
+                instance_id=f"instance-{len(apps)}",
                 is_closed=False,
                 begin_shutdown=lambda: None,
                 http_started=lambda: None,
@@ -338,7 +342,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
         commands.serve()
 
     assert len(servers) == 2
-    open_admin.assert_called_once_with(settings, 0)
+    open_admin.assert_called_once_with(settings, 0, "instance-0")
     clear_settings_cache.assert_called_once()
     kill_all.assert_called_once()
 
@@ -346,7 +350,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
 def test_serve_supervisor_refuses_restart_after_incomplete_shutdown() -> None:
     from free_claude_code.cli import commands
 
-    settings = _launcher_settings()
+    settings = _launcher_settings(port=0)
     get_settings = MagicMock(return_value=settings)
     servers: list[object] = []
     restart_callbacks: list[Callable[[], None]] = []
@@ -355,6 +359,7 @@ def test_serve_supervisor_refuses_restart_after_incomplete_shutdown() -> None:
         restart_callbacks.append(restart_callback)
         return SimpleNamespace(
             runtime=SimpleNamespace(
+                instance_id="incomplete-instance",
                 is_closed=False,
                 begin_shutdown=lambda: None,
                 http_started=lambda: None,
@@ -434,6 +439,7 @@ def test_claude_child_env_targets_current_proxy_config() -> None:
             "ANTHROPIC_AUTH_TOKEN": "old-token",
             "ANTHROPIC_API_KEY": "official-key",
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "0",
+            "CLAUDE_CODE_AUTO_MODE_SERVER": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "DISABLE_AUTOUPDATER": "0",
             "DISABLE_FEEDBACK_COMMAND": "0",
@@ -446,6 +452,7 @@ def test_claude_child_env_targets_current_proxy_config() -> None:
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9090"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "proxy-token"
     assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+    assert env["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
     assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "190000"
     assert env["DISABLE_AUTOUPDATER"] == "1"
     assert env["DISABLE_FEEDBACK_COMMAND"] == "1"

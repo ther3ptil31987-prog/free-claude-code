@@ -144,7 +144,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
         ("test_opencode_cli_prompt_e2e",),
         ("clients",),
         (
-            "stable OpenCode V1 CLI",
+            "stable OpenCode 2 CLI",
             "configured provider credentials or local provider endpoint",
         ),
         "skip only when OpenCode is absent; configured providers must pass",
@@ -211,10 +211,33 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
             "test_dsh_cli_headless_e2e",
             "test_dsh_cli_terminal_failure_e2e",
             "test_dsh_cli_web_startup_e2e",
+            "test_dsh_cli_tools_and_resume_e2e",
+            "test_dsh_native_operations_e2e",
+            "test_dsh_native_settings_migration_and_dump_e2e",
         ),
         ("clients",),
-        ("DeepSeek Harness 0.1.0-rc.8",),
+        ("DeepSeek Harness >=0.2.0-rc.2",),
         "skip only when DSH is absent; the local fake upstream must pass",
+    ),
+    FeatureCoverage(
+        "dsh_desktop_integration",
+        "DSH Desktop uses a persistent FCC model catalog and credential",
+        (
+            "tests/harnesses/test_dsh_desktop_integration.py",
+            "tests/harnesses/test_dsh_files.py",
+            "tests/runtime/test_dsh_desktop_sync.py",
+            "tests/api/test_dsh_desktop_integration.py",
+            "e2e/test_dsh_desktop_integration.py",
+        ),
+        (),
+        ("test_dsh_desktop_live_catalog_credentials_and_restart_e2e",),
+        ("clients",),
+        (
+            "DSH Desktop >=0.2.0-rc.2",
+            "Node.js",
+            "FCC_SMOKE_DSH_DESKTOP_BIN for a custom installation",
+        ),
+        "skip when Desktop or Node is absent; native acceptance uses isolated profiles and local providers",
     ),
     FeatureCoverage(
         "grok_cli_integration",
@@ -325,9 +348,12 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
         "configured providers must not reject adaptive thinking payloads",
     ),
     FeatureCoverage(
-        "heuristic_tool_parser",
+        "native_tool_assembly",
         "Tool use and tool result continuation survive provider/client paths",
-        ("tests/providers/test_parsers.py", "tests/contracts/test_stream_contracts.py"),
+        (
+            "tests/providers/test_native_tool_arguments.py",
+            "tests/contracts/test_stream_contracts.py",
+        ),
         ("test_live_tool_use_when_configured_model_supports_tools",),
         (
             "test_provider_interleaved_thinking_tool_e2e",
@@ -405,7 +431,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     ),
     FeatureCoverage(
         "subagent_control",
-        "Task-like tool output is rendered and controlled as foreground work",
+        "Task arguments are preserved and tool output is rendered in transcripts",
         ("tests/providers/test_subagent_interception.py",),
         (),
         ("test_messaging_subagent_control_e2e",),
@@ -638,8 +664,8 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     ),
     FeatureCoverage(
         "session_persistence",
-        "Session JSON preserves scoped trees and message logs",
-        ("tests/messaging/test_session_store_edge_cases.py",),
+        "SQLite persistence preserves scoped trees and message logs",
+        ("tests/runtime/test_messaging_sqlite.py",),
         (),
         ("test_restart_restore_and_session_persistence_e2e",),
         ("messaging",),

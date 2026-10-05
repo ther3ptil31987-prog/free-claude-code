@@ -1,5 +1,7 @@
 """Rendered connected-account flows use provider-owned capabilities and identity."""
 
+import time
+
 import pytest
 from playwright.sync_api import Dialog, Page, Route, expect
 
@@ -54,6 +56,23 @@ class _Accounts:
         self.pending_status: list[Route] = []
         self.hold_login = False
         self.pending_login: list[Route] = []
+
+    def take_pending_status(self, page: Page) -> Route:
+        deadline = time.monotonic() + 5
+        while not self.pending_status:
+            if time.monotonic() >= deadline:
+                pytest.fail("Account status request did not reach the route handler")
+            # Pump Playwright events so the route handler can enqueue the request.
+            page.wait_for_timeout(10)
+        return self.pending_status.pop(0)
+
+    def take_pending_login(self, page: Page) -> Route:
+        deadline = time.monotonic() + 5
+        while not self.pending_login:
+            if time.monotonic() >= deadline:
+                pytest.fail("Account login request did not reach the route handler")
+            page.wait_for_timeout(10)
+        return self.pending_login.pop(0)
 
     def config(self, route: Route) -> None:
         response = route.fetch()
@@ -170,9 +189,7 @@ def test_account_modes_wait_for_status_and_recover_after_load_failure(
     expect(copilot.get_by_role("button", name="Loading…", exact=True)).to_be_disabled()
     expect(copilot.get_by_role("button", name="Connect", exact=True)).to_have_count(0)
     expect(openai.get_by_role("button", name="Connect", exact=True)).to_be_enabled()
-    assert len(accounts.pending_status) == 1
-
-    accounts.pending_status.pop().fulfill(
+    accounts.take_pending_status(page).fulfill(
         status=503, json={"detail": "Account status unavailable."}
     )
     expect(copilot.locator(".provider-meta")).to_have_text(
@@ -181,9 +198,9 @@ def test_account_modes_wait_for_status_and_recover_after_load_failure(
     expect(copilot.get_by_role("button", name="Connect", exact=True)).to_have_count(0)
     copilot.get_by_role("button", name="Retry", exact=True).click()
     expect(copilot.get_by_role("button", name="Loading…", exact=True)).to_be_disabled()
-    assert len(accounts.pending_status) == 1
+    retry = accounts.take_pending_status(page)
     accounts.hold_status.clear()
-    accounts.pending_status.pop().fulfill(json=accounts.statuses["github_copilot"])
+    retry.fulfill(json=accounts.statuses["github_copilot"])
 
     expect(copilot.get_by_role("button", name="Connect", exact=True)).to_be_enabled()
     expect(copilot.get_by_role("button", name="Use device code")).to_have_count(0)
@@ -238,9 +255,10 @@ def test_openai_connect_uses_browser_login(
     try:
         assert popup.url == "about:blank"
         assert popup.evaluate("window.opener === null") is True
+        login = accounts.take_pending_login(page)
         assert accounts.login_requests == [("openai", "browser")]
-        assert len(accounts.pending_login) == 1
-        accounts.pending_login.pop().fulfill(json=accounts.statuses["openai"])
+        assert not accounts.pending_login
+        login.fulfill(json=accounts.statuses["openai"])
         popup.wait_for_url(f"{admin_base_url}/account-test-sign-in")
     finally:
         popup.close()
@@ -343,6 +361,7 @@ def test_oauth_card_follows_model_discovery_without_replacing_settings(
         data["cached_models"][provider_id] = (
             ["model-a", "model-b"] if phase == "ready" else []
         )
+        data["cached_models"]["open_router"] = data["cached_models"][provider_id]
         route.fulfill(json=data)
 
     page.route("**/admin/api/status", status)
@@ -351,6 +370,7 @@ def test_oauth_card_follows_model_discovery_without_replacing_settings(
     other = page.locator('[data-provider-check-result="open_router"]')
     expect(card.get_by_role("button", name="Disconnect", exact=True)).to_be_enabled()
     expect(card.locator(".provider-meta")).to_have_text("Checking models…")
+    expect(other).to_have_text("Checking models…")
     expect(card.locator(".provider-meta")).to_have_css(
         "color", other.evaluate("element => getComputedStyle(element).color")
     )
@@ -359,11 +379,13 @@ def test_oauth_card_follows_model_discovery_without_replacing_settings(
     proxy.fill("http://pending-proxy:8080")
     proxy.evaluate("input => input.setSelectionRange(7, 14)")
     phase = outcome
-    expect(card.locator(".provider-meta")).to_have_text(
+    expected_message = (
         "2 models available"
         if outcome == "ready"
         else "Could not load models. Check the provider's settings and retry."
     )
+    expect(card.locator(".provider-meta")).to_have_text(expected_message)
+    expect(other).to_have_text(expected_message)
     expect(card.locator(".provider-meta")).to_have_css(
         "color", other.evaluate("element => getComputedStyle(element).color")
     )

@@ -71,9 +71,6 @@ def _openai_provider(
         make_provider_config(
             api_key="",
             base_url="https://chatgpt.com/backend-api/codex",
-            rate_limit=100,
-            rate_window=1,
-            max_concurrency=2,
         ),
         auth=_FakeOpenAIAuth(),
         admission=ProviderAdmissionController(
@@ -91,7 +88,10 @@ def _openai_provider(
 
 
 @pytest.mark.asyncio
-async def test_messages_accepts_current_claude_controls_for_openai_provider() -> None:
+@pytest.mark.parametrize("display", ["summarized", "omitted", "updates"])
+async def test_messages_accepts_current_claude_controls_for_openai_provider(
+    display: str,
+) -> None:
     upstream_requests: list[httpx2.Request] = []
     provider = _openai_provider(
         upstream_requests,
@@ -108,7 +108,7 @@ async def test_messages_accepts_current_claude_controls_for_openai_provider() ->
                     "max_tokens": 1024,
                     "messages": [{"role": "user", "content": "hello"}],
                     "metadata": {"user_id": "example-user"},
-                    "thinking": {"type": "adaptive", "display": "omitted"},
+                    "thinking": {"type": "adaptive", "display": display},
                     "context_management": {
                         "edits": [
                             {

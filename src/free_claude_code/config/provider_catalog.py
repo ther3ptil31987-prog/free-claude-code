@@ -54,6 +54,7 @@ KILO_DEFAULT_BASE = "https://api.kilo.ai/api/gateway"
 OPENAI_CODEX_DEFAULT_BASE = "https://chatgpt.com/backend-api/codex"
 # xAI OpenAI-compatible Chat Completions API.
 XAI_DEFAULT_BASE = "https://api.x.ai/v1"
+ALIBABA_CLOUD_DEFAULT_BASE = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 # QwenCloud Token Plan OpenAI-compatible Chat Completions API.
 QWENCLOUD_DEFAULT_BASE = (
     "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
@@ -86,6 +87,14 @@ LLM7_DEFAULT_BASE = "https://api.llm7.io/v1"
 LIGHTNING_DEFAULT_BASE = "https://lightning.ai/api/v1"
 # Experiential Labs OpenAI-compatible Chat Completions gateway.
 EXPERIENTIAL_DEFAULT_BASE = "https://api.experientiallabs.ai/v1"
+# Cheaper Inference OpenAI-compatible Chat Completions gateway.
+CHEAPERINFERENCE_DEFAULT_BASE = "https://api.cheaperinference.com/v1"
+# OrcaRouter OpenAI-compatible multi-provider gateway.
+ORCAROUTER_DEFAULT_BASE = "https://api.orcarouter.ai/v1"
+# xKiro OpenAI-compatible multi-provider gateway.
+XKIRO_DEFAULT_BASE = "https://api.xkiro.com/v1"
+# Opper OpenAI-compatible Chat Completions gateway.
+OPPER_DEFAULT_BASE = "https://api.opper.ai/v3/compat"
 # Agnes AI OpenAI-compatible Chat Completions API.
 AGNES_DEFAULT_BASE = "https://apihub.agnes-ai.com/v1"
 # ZenMux OpenAI-compatible Chat Completions gateway.
@@ -119,6 +128,7 @@ class ProviderDescriptor:
     base_url_attr: str | None = None
     proxy_attr: str | None = None
     required_settings_attrs: tuple[str, ...] = ()
+    native_messages_passthrough: bool = False
 
     def configuration_attrs(self) -> tuple[str, ...]:
         """Return settings fields whose non-empty values configure this provider."""
@@ -185,6 +195,29 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         default_base_url=OPENAI_CODEX_DEFAULT_BASE,
         proxy_attr="openai_proxy",
     ),
+    "openai_api": ProviderDescriptor(
+        provider_id="openai_api",
+        display_name="OpenAI API",
+        website_url="https://platform.openai.com/",
+        logo_filename="openai.svg",
+        credential_env="OPENAI_API_KEY",
+        credential_url="https://platform.openai.com/api-keys",
+        credential_attr="openai_api_key",
+        default_base_url="https://api.openai.com/v1",
+        proxy_attr="openai_api_proxy",
+    ),
+    "anthropic": ProviderDescriptor(
+        provider_id="anthropic",
+        display_name="Anthropic",
+        website_url="https://www.anthropic.com/",
+        logo_filename="anthropic.svg",
+        credential_env="ANTHROPIC_API_KEY",
+        credential_attr="anthropic_api_key",
+        credential_url="https://platform.claude.com/settings/keys",
+        default_base_url="https://api.anthropic.com/v1",
+        proxy_attr="anthropic_proxy",
+        native_messages_passthrough=True,
+    ),
     "github_copilot": ProviderDescriptor(
         provider_id="github_copilot",
         display_name="GitHub Copilot",
@@ -203,6 +236,18 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_attr="xai_api_key",
         default_base_url=XAI_DEFAULT_BASE,
         proxy_attr="xai_proxy",
+    ),
+    "alibaba_cloud": ProviderDescriptor(
+        provider_id="alibaba_cloud",
+        display_name="Alibaba Cloud",
+        website_url="https://www.alibabacloud.com/en/product/modelstudio",
+        logo_filename="alibabacloud-color.svg",
+        credential_env="ALIBABA_CLOUD_API_KEY",
+        credential_url="https://www.alibabacloud.com/help/en/model-studio/get-api-key",
+        credential_attr="alibaba_cloud_api_key",
+        default_base_url=ALIBABA_CLOUD_DEFAULT_BASE,
+        base_url_attr="alibaba_cloud_base_url",
+        proxy_attr="alibaba_cloud_proxy",
     ),
     "qwencloud": ProviderDescriptor(
         provider_id="qwencloud",
@@ -608,7 +653,6 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_url="https://www.tokenrouter.com/",
         credential_attr="tokenrouter_api_key",
         default_base_url=TOKENROUTER_DEFAULT_BASE,
-        base_url_attr="tokenrouter_base_url",
         proxy_attr="tokenrouter_proxy",
     ),
     "nararoute": ProviderDescriptor(
@@ -620,7 +664,6 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_url="https://router.bynara.id/keys",
         credential_attr="nararoute_api_key",
         default_base_url=NARAROUTE_DEFAULT_BASE,
-        base_url_attr="nararoute_base_url",
         proxy_attr="nararoute_proxy",
     ),
     "poolside": ProviderDescriptor(
@@ -665,7 +708,6 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_url="https://lightning.ai/lightning-ai/model-apis/models",
         credential_attr="lightning_api_key",
         default_base_url=LIGHTNING_DEFAULT_BASE,
-        base_url_attr="lightning_base_url",
         proxy_attr="lightning_proxy",
     ),
     "experiential": ProviderDescriptor(
@@ -677,8 +719,51 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_url="https://platform.experientiallabs.ai/settings/api-keys",
         credential_attr="experiential_api_key",
         default_base_url=EXPERIENTIAL_DEFAULT_BASE,
-        base_url_attr="experiential_base_url",
         proxy_attr="experiential_proxy",
+    ),
+    "cheaperinference": ProviderDescriptor(
+        provider_id="cheaperinference",
+        display_name="Cheaper Inference",
+        website_url="https://cheaperinference.com/",
+        logo_filename="cheaperinference.svg",
+        credential_env="CHEAPER_INFERENCE_API_KEY",
+        credential_url="https://cheaperinference.com/signup",
+        credential_attr="cheaperinference_api_key",
+        default_base_url=CHEAPERINFERENCE_DEFAULT_BASE,
+        proxy_attr="cheaperinference_proxy",
+    ),
+    "orcarouter": ProviderDescriptor(
+        provider_id="orcarouter",
+        display_name="OrcaRouter",
+        website_url="https://www.orcarouter.ai/",
+        logo_filename="orcarouter.png",
+        credential_env="ORCAROUTER_API_KEY",
+        credential_url="https://www.orcarouter.ai/console",
+        credential_attr="orcarouter_api_key",
+        default_base_url=ORCAROUTER_DEFAULT_BASE,
+        proxy_attr="orcarouter_proxy",
+    ),
+    "xkiro": ProviderDescriptor(
+        provider_id="xkiro",
+        display_name="xKiro",
+        website_url="https://xkiro.com/",
+        logo_filename="xkiro.png",
+        credential_env="XKIRO_API_KEY",
+        credential_url="https://xkiro.com/dashboard/api/keys",
+        credential_attr="xkiro_api_key",
+        default_base_url=XKIRO_DEFAULT_BASE,
+        proxy_attr="xkiro_proxy",
+    ),
+    "opper": ProviderDescriptor(
+        provider_id="opper",
+        display_name="Opper",
+        website_url="https://opper.ai/",
+        logo_filename="opper.svg",
+        credential_env="OPPER_API_KEY",
+        credential_url="https://platform.opper.ai/",
+        credential_attr="opper_api_key",
+        default_base_url=OPPER_DEFAULT_BASE,
+        proxy_attr="opper_proxy",
     ),
     "ollama_cloud": ProviderDescriptor(
         provider_id="ollama_cloud",

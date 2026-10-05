@@ -11,6 +11,8 @@ const state = {
   authStatuses: new Map(),
   providerChecks: new Map(),
   providerId: null,
+  customProvider: null,
+  modelLabels: new Map(),
   localStatusRequest: null,
   startup: null,
   startupRequest: null,
@@ -121,12 +123,12 @@ function renderStartup() {
   const message = byId("startupMessage");
   if (message) {
     const messaging = startup?.messaging;
-    const visible = state.activeView === "messaging" && ["starting", "failed"].includes(messaging?.state);
+    const visible = state.activeView === "messaging" && (["starting", "failed"].includes(messaging?.state) || Boolean(messaging?.warning));
     message.hidden = !visible;
     message.classList.toggle("startup-spinner", visible && messaging.state === "starting");
     message.classList.toggle("error", messaging?.state === "failed");
-    message.textContent = messaging?.state === "failed" ? messaging.message || "Messaging could not start." : "";
-    message.setAttribute("aria-label", "Messaging is starting");
+    message.textContent = messaging?.state === "failed" ? messaging.message || "Messaging could not start." : messaging?.warning || "";
+    message.setAttribute("aria-label", messaging?.state === "starting" ? "Messaging is starting" : "Messaging status");
   }
   if (!startup) return;
   document.querySelectorAll("[data-startup-provider]").forEach((button) => {
@@ -138,7 +140,12 @@ function renderStartup() {
   state.config.provider_status.forEach((provider) => {
     renderProviderCheckResult(provider.provider_id);
   });
+  renderClaudeIntegration();
+  renderVSCodeChatIntegration();
+  renderJetBrainsIntegration();
   renderCodexIntegration();
+  renderClaudeDesktopIntegration();
+  renderDshDesktopIntegration();
 }
 
 async function refreshStartup() {
@@ -162,12 +169,17 @@ async function refreshStartup() {
     )) return;
     state.startup = result;
     renderStartup();
+    refreshIntegrationUpdates(
+      previous?.instance_id === result.instance_id ? previous.startup.integrations : null,
+      current.integrations,
+    );
     const changed = !previous || previous.instance_id !== result.instance_id ||
       JSON.stringify(previous.startup) !== JSON.stringify(current);
     if (changed) void hydrateModelOptions();
     if (changed || state.codeCatalogRetry) state.codeCatalogRetry = await window.CodeSessions?.refresh(result) === false;
     pending = state.codeCatalogRetry || current.catalog === "starting" || current.catalog_file === "starting" ||
       current.code?.state === "starting" || current.messaging?.state === "starting" ||
+      Object.values(current.integrations || {}).some((update) => update.state === "starting") ||
       Object.values(current.providers || {}).includes("starting");
   } catch (error) {
     if (error.name !== "AbortError") pending = true;
@@ -201,7 +213,10 @@ async function load({ providersOnly = false } = {}) {
   state.startupRequest = null;
   showMessage("Loading admin config");
   const config = await api("/admin/api/config");
+  config.custom_providers ||= [];
+  config.provider_status.push(...config.custom_providers.map((provider) => ({ ...provider, kind: "custom", status: "configured", settings_keys: [], missing_configuration_keys: [] })));
   state.config = config;
+  window.CodeSessions.setProviderNames(config.custom_providers);
   state.startup = null;
   state.fields = new Map(config.fields.map((field) => [field.key, field]));
   if (!providersOnly) renderNav();
@@ -278,7 +293,11 @@ function setActiveView(viewId, { scroll = false } = {}) {
   else window.CodeSessions.deactivate();
   if (activeView.id === "integrations") {
     refreshClaudeIntegration();
+    refreshVSCodeChatIntegration();
+    refreshJetBrainsIntegration();
     refreshCodexIntegration();
+    refreshClaudeDesktopIntegration();
+    refreshDshDesktopIntegration();
   }
 }
 
@@ -324,6 +343,25 @@ function renderProviders(providerStatus) {
     });
     container.appendChild(group);
   });
+  const custom = document.createElement("section");
+  custom.className = "provider-strip";
+  custom.dataset.providerGroup = "custom";
+  const heading = document.createElement("h3");
+  heading.textContent = "Custom providers";
+  const add = authButton("Add provider", () => openCustomProviderDialog(), "primary-button");
+  add.id = "addCustomProvider";
+  add.disabled = !!state.config.custom_providers_locked;
+  const empty = document.createElement("p");
+  empty.textContent = "No custom providers yet.";
+  empty.hidden = state.config.custom_providers.length > 0;
+  const grid = document.createElement("div");
+  grid.className = "provider-grid";
+  grid.id = "providers-custom";
+  const header = document.createElement("div");
+  header.className = "strip-header";
+  header.append(heading, add);
+  custom.append(header, empty, grid);
+  container.appendChild(custom);
   providerStatus.forEach(updateProviderCard);
 }
 
@@ -333,7 +371,7 @@ function updateProviderCard(provider) {
   const kind = oauth ? "oauth" : provider.kind === "local" ? "local" : "cloud";
   const configured = oauth ? status?.connected : provider.status === "configured";
   const subgroup = oauth && configured == null ? "loading" : configured ? "configured" : "unconfigured";
-  const grid = byId(`providers-${kind}-${subgroup}`);
+  const grid = byId(provider.kind === "custom" ? "providers-custom" : `providers-${kind}-${subgroup}`);
   let card = document.querySelector(`[data-provider="${provider.provider_id}"]`);
   if (!card) {
     card = document.createElement("article");
@@ -352,12 +390,12 @@ function updateProviderCard(provider) {
   website.rel = "noopener noreferrer";
   const logo = document.createElement("img");
   logo.className = "provider-logo";
-  logo.src = new URL(`providers/${provider.logo_filename}`, adminAssetBase);
+  if (provider.logo_filename) logo.src = new URL(`providers/${provider.logo_filename}`, adminAssetBase);
   logo.alt = "";
   logo.width = 20;
   logo.height = 20;
   website.append(name, logo);
-  title.appendChild(website);
+  title.appendChild(provider.kind === "custom" ? name : website);
   const meta = document.createElement("span");
   meta.className = "provider-meta";
   meta.hidden = !oauth;
@@ -368,7 +406,7 @@ function updateProviderCard(provider) {
   const actions = document.createElement("div");
   actions.className = "provider-actions";
   if (oauth) populateConnectedAccountActions(provider, status, actions);
-  if (provider.settings_keys?.length) {
+  if (provider.kind === "custom" || provider.settings_keys?.length) {
     const edit = oauth || configured;
     const settings = authButton(edit ? "Edit" : "Configure", () => openProviderDialog(provider.provider_id), edit ? "secondary-button" : "primary-button");
     settings.dataset.providerSettings = "true";
@@ -391,6 +429,8 @@ function updateProviderCard(provider) {
 }
 
 function openProviderDialog(providerId) {
+  if (connectedAccountDescriptor(providerId)?.kind === "custom") return openCustomProviderDialog(providerId);
+  state.customProvider = null;
   state.providerId = providerId;
   const provider = connectedAccountDescriptor(providerId);
   byId("providerDialogTitle").textContent = connectedAccountName(provider);
@@ -419,7 +459,70 @@ function openProviderDialog(providerId) {
   first?.focus();
 }
 
+const CUSTOM_LABELS = {
+  provider_default: "Provider default", openai_effort: "OpenAI effort", limited_effort: "Limited effort (low / medium / high)",
+  reasoning_object: "Reasoning object", thinking: "Thinking on/off", chat_template: "Chat-template thinking",
+  native_responses: "Native reasoning", messages_manual: "Token-budget thinking", messages_adaptive: "Adaptive thinking",
+};
+
+function openCustomProviderDialog(providerId = null) {
+  const provider = state.config.custom_providers.find((item) => item.provider_id === providerId) || {
+    display_name: "", base_url: "", api_key: null, api_format: "openai_chat", reasoning_format: "provider_default", reasoning_history_format: "disabled", model_ids: [],
+  };
+  state.providerId = providerId || "__custom_new__";
+  state.customProvider = provider;
+  byId("providerDialogTitle").textContent = providerId ? provider.display_name : "Add provider";
+  byId("providerMessage").textContent = "";
+  byId("providerDialogCheck").hidden = true;
+  const fields = byId("providerFields");
+  fields.replaceChildren();
+  const formats = (state.config.custom_reasoning_formats || {})[provider.api_format] || ["provider_default"];
+  const definitions = [
+    ["display_name", "Name", "string", [], ""],
+    ["base_url", "Base URL", "string", [], "Include the API path, for example https://gateway.example/v1."],
+    ["api_key", "API key", "secret", [], "Optional for endpoints that do not require a key."],
+    ["api_format", "API format", "select", [["openai_chat", "Chat Completions"], ["openai_responses", "Responses"], ["anthropic_messages", "Anthropic Messages"]], "Select the API exposed by your endpoint."],
+    ["reasoning_format", "Reasoning format", "select", formats.map((value) => [value, CUSTOM_LABELS[value]]), "How FCC sends reasoning controls. Provider default leaves computation to the upstream."],
+    ["reasoning_history_format", "Reasoning history format", "select", [["disabled", "Text context"], ["reasoning_content", "reasoning_content"], ["reasoning", "reasoning"], ["think_tags", "Think tags"]], "How previous reasoning is sent to a Chat Completions endpoint."],
+    ["model_ids", "Model IDs", "textarea", [], "Optional, one upstream model ID per line. Leave empty to discover models automatically."],
+  ];
+  for (const [key, label, type, options, description] of definitions) {
+    fields.appendChild(renderField({ key, label, type, options: options.map(([value, label]) => ({value, label})), description,
+      value: key === "model_ids" ? provider.model_ids.join("\n") : provider[key], nullable: key === "api_key", secret: key === "api_key",
+      configured: key === "api_key" && !!provider.api_key, locked: !!state.config.custom_providers_locked, source: "managed_env" }));
+  }
+  const format = byId("field-api_format");
+  const reasoning = byId("field-reasoning_format");
+  const history = byId("field-reasoning_history_format");
+  history.closest(".field").hidden = format.value !== "openai_chat";
+  format.addEventListener("change", () => {
+    const allowed = state.config.custom_reasoning_formats[format.value];
+    const previous = reasoning.value;
+    reasoning.replaceChildren(...allowed.map((value) => option(value, CUSTOM_LABELS[value])));
+    reasoning.value = allowed.includes(previous) ? previous : "provider_default";
+    history.closest(".field").hidden = format.value !== "openai_chat";
+    if (format.value !== "openai_chat") history.value = "disabled";
+    updateDirtyState();
+  });
+  const actions = byId("providerDialogActions");
+  actions.replaceChildren();
+  if (providerId && !state.config.custom_providers_locked) {
+    if (!provider.model_ids.length) actions.appendChild(authButton("Refresh models", (button) => testProvider(providerId, button), "secondary-button"));
+    actions.appendChild(authButton("Remove provider", () => apply(providerId, "delete"), "danger-button"));
+    const modelConfig = document.createElement("a");
+    modelConfig.href = "/admin/model_config";
+    modelConfig.textContent = "Model Config";
+    modelConfig.addEventListener("click", (event) => { event.preventDefault(); byId("providerDialog").close(); navigateToView("model_config"); });
+    actions.appendChild(modelConfig);
+  }
+  byId("saveProvider").hidden = false;
+  updateDirtyState();
+  byId("providerDialog").showModal();
+  byId("field-display_name").focus();
+}
+
 function renderProviderDialogActions(provider) {
+  if (state.customProvider) return;
   if (state.providerId !== provider.provider_id) return;
   const actions = byId("providerDialogActions");
   actions.replaceChildren();
@@ -845,6 +948,7 @@ function renderField(field) {
 }
 
 function inputForField(field) {
+  if (field.type === "textarea") { const input = document.createElement("textarea"); input.rows = 3; input.value = field.value || ""; return input; }
   if (field.type === "boolean") {
     const input = document.createElement("input");
     input.type = "checkbox";
@@ -904,6 +1008,7 @@ function createModelCombobox(input, field) {
   return new window.FccModelCombobox(input, {
     listboxId: `model-options-${field.key}`,
     label: field.label,
+    displayValue: (value) => state.modelLabels.get(value) || value,
     values: () =>
       field.type === "optional_model"
         ? ["None", ...state.modelOptions]
@@ -1209,14 +1314,22 @@ function showRestartNotice() {
   }
 }
 
-async function apply(providerId = null) {
+async function apply(providerId = null, customAction = null) {
   if (state.applying) return;
   if (state.restart) {
     await reconnectAfterRestart();
     return;
   }
   const values = changedValues(providerId ? byId("providerFields") : byId("adminViews"));
-  if (!Object.keys(values).length) return;
+  const custom = providerId && state.customProvider;
+  let mutation = null;
+  if (custom) {
+    const action = customAction || (custom.provider_id ? "update" : "create");
+    if ("model_ids" in values) values.model_ids = values.model_ids.split(/\r?\n/).map((id) => id.trim()).filter(Boolean);
+    mutation = { action, values: action === "delete" ? {} : values };
+    if (custom.provider_id) mutation.provider_id = custom.provider_id;
+  }
+  if (!Object.keys(values).length && mutation?.action !== "delete") return;
   const checkingKeys = Object.keys(values).some((key) => {
     const field = state.fields.get(key);
     return field?.secret && field.section === "providers" && values[key] !== null;
@@ -1228,7 +1341,7 @@ async function apply(providerId = null) {
   try {
     const result = await api("/admin/api/config/apply", {
       method: "POST",
-      body: JSON.stringify({ values }),
+      body: JSON.stringify(mutation ? { custom_provider: mutation } : { values }),
     });
     const checks = result.credential_checks || [];
     if (!result.applied) {
@@ -1263,7 +1376,10 @@ async function apply(providerId = null) {
       rejectedField.scrollIntoView({ block: "center", behavior: "instant" });
       rejectedField.focus();
     } else if (providerId && applied) {
-      document.querySelector(`[data-provider="${providerId}"] [data-provider-settings]`)?.focus({ preventScroll: true });
+      const focus = mutation && mutation.action !== "update"
+        ? byId("addCustomProvider")
+        : document.querySelector(`[data-provider="${providerId}"] [data-provider-settings]`);
+      focus?.focus({ preventScroll: true });
     }
   }
 }
@@ -1276,41 +1392,26 @@ async function refreshLocalStatus(config) {
   };
   state.localStatusRequest = request;
   try {
-    const result = await api("/admin/api/providers/local-status");
-    if (state.localStatusRequest !== request) return;
-    result.providers.forEach((provider) => {
-      if (!request.providerIds.has(provider.provider_id) || provider.status === "missing_url") return;
-      if (provider.status === "reachable") {
-        updateProviderCheckResult(
-          provider.provider_id,
-          "ok",
-          `Reachable: ${provider.base_url}`,
-          "availability",
-        );
-        return;
+    await Promise.all([...request.providerIds].map(async (providerId) => {
+      try {
+        const provider = await api(`/admin/api/providers/${providerId}/local-status`);
+        if (state.localStatusRequest !== request || !request.providerIds.has(providerId)) return;
+        if (provider.status === "missing_url") return;
+        if (provider.status === "reachable") {
+          updateProviderCheckResult(providerId, "ok", `Reachable: ${provider.base_url}`, "availability");
+          return;
+        }
+        const detail = provider.message
+          ? provider.message
+          : provider.status_code
+            ? `${provider.base_url} returned HTTP ${provider.status_code}`
+            : "The local provider did not respond.";
+        updateProviderCheckResult(providerId, "error", `Unavailable: ${detail}`, "availability");
+      } catch {
+        if (state.localStatusRequest !== request || !request.providerIds.has(providerId)) return;
+        updateProviderCheckResult(providerId, "error", "Availability check failed. Use Test to retry.", "availability");
       }
-      const detail = provider.message
-        ? provider.message
-        : provider.status_code
-          ? `${provider.base_url} returned HTTP ${provider.status_code}`
-          : "The local provider did not respond.";
-      updateProviderCheckResult(
-        provider.provider_id,
-        "error",
-        `Unavailable: ${detail}`,
-        "availability",
-      );
-    });
-  } catch {
-    if (state.localStatusRequest !== request) return;
-    request.providerIds.forEach((providerId) => {
-      updateProviderCheckResult(
-        providerId,
-        "error",
-        "Availability check failed. Use Test to retry.",
-        "availability",
-      );
-    });
+    }));
   } finally {
     if (state.localStatusRequest === request) state.localStatusRequest = null;
   }
@@ -1375,7 +1476,7 @@ async function loadModelOptions(refresh = false) {
   const result = await api("/admin/api/models" + (refresh ? "/refresh" : ""), {
     method: refresh ? "POST" : "GET",
   });
-  if (request === state.modelOptionsRequest && config === state.config) setModelOptions(result.models);
+  if (request === state.modelOptionsRequest && config === state.config) { state.modelLabels = new Map(Object.entries(result.model_labels || {})); setModelOptions(result.models); }
   if (refresh && window.CodeSessions) await window.CodeSessions.refresh();
   return result;
 }
@@ -1449,6 +1550,8 @@ byId("providerDialog").addEventListener("click", (event) => {
 byId("providerDialog").addEventListener("close", () => {
   if (byId("providerDialog").open) return;
   const providerId = state.providerId;
+  const wasCustom = !!state.customProvider;
+  state.customProvider = null;
   state.providerId = null;
   byId("providerFields").replaceChildren();
   updateDirtyState();
@@ -1474,7 +1577,7 @@ try {
 }
 
 const claudeIntegrationDialog = byId("claudeIntegrationDialog");
-const claudeIntegration = { connected: null, busy: false, paths: null };
+const claudeIntegration = { connected: null, busy: false, paths: null, update: null };
 const claudeIntegrationPath = "/admin/api/integrations/claude-vscode";
 
 function integrationMessage(id, message, error = false) {
@@ -1484,8 +1587,60 @@ function integrationMessage(id, message, error = false) {
   element.classList.toggle("error", error);
 }
 
+function integrationUpdating(integration, id) {
+  return integration.update?.state === "starting" ||
+    state.startup?.startup?.integrations?.[id]?.state === "starting";
+}
+
+function beginIntegrationCheck(integration) {
+  if (integration.busy && (!integration.checkRequest || integration.checkRequest.config === state.config)) return null;
+  const request = { config: state.config };
+  integration.checkRequest = request;
+  integration.busy = true;
+  return request;
+}
+
+function currentIntegrationCheck(integration, request) {
+  return integration.checkRequest === request && request.config === state.config;
+}
+
+function finishIntegrationCheck(integration, request, render) {
+  if (integration.checkRequest !== request) return;
+  integration.checkRequest = null;
+  integration.busy = false;
+  render();
+  if (request.config === state.config && integration.update?.state === "starting") void refreshStartup();
+}
+
+function refreshIntegrationUpdates(previous, current) {
+  if (state.activeView !== "integrations") return;
+  for (const [id, integration, refresh, messageId, message] of [
+    ["vscode-chat", vscodeChatIntegration, refreshVSCodeChatIntegration, "vscodeChatIntegrationMessage", "Models updated in VS Code."],
+    ["claude-vscode", claudeIntegration, refreshClaudeIntegration, "claudeIntegrationMessage", "Settings updated. Reload VS Code."],
+    ["jetbrains-acp", jetBrainsIntegration, refreshJetBrainsIntegration, "jetBrainsIntegrationMessage", "Settings updated. Reopen JetBrains and start a new chat."],
+    ["codex", codexIntegration, refreshCodexIntegration, "codexIntegrationMessage", "Settings updated. Restart Codex."],
+    ["claude-desktop", claudeDesktopIntegration, refreshClaudeDesktopIntegration, "claudeDesktopIntegrationMessage", "Settings updated. Reopen Claude Desktop."],
+    ["dsh-desktop", dshDesktopIntegration, refreshDshDesktopIntegration, "dshDesktopIntegrationMessage", "DSH Desktop configuration updated."],
+  ]) {
+    const phase = current?.[id]?.state;
+    // Successful actions clear update metadata, not the last observed state.
+    const observedPhase = integration.update?.state ?? previous?.[id]?.state;
+    // Polling can miss a short update. Reconcile state independently of notices.
+    if (phase && phase !== "starting" && (
+      previous?.[id]?.state === "starting" || observedPhase !== phase
+    )) {
+      if (integration.busy) state.startupAgain = true;
+      else void refresh(false, { background: true });
+    }
+    if (previous?.[id]?.state === "starting" && phase === "ready" && current[id].changed === true) {
+      integrationMessage(messageId, message);
+    }
+  }
+}
+
 function renderClaudeIntegration() {
-  const { connected, busy, paths } = claudeIntegration;
+  const { connected, paths } = claudeIntegration;
+  const busy = claudeIntegration.busy || integrationUpdating(claudeIntegration, "claude-vscode");
   const action = connected ? "Disconnect" : "Connect";
   byId("openClaudeIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
   byId("openClaudeIntegration").disabled = busy;
@@ -1511,34 +1666,40 @@ function renderClaudeIntegration() {
   }
 }
 
-async function refreshClaudeIntegration() {
-  if (claudeIntegration.busy) return;
-  claudeIntegration.busy = true;
+async function refreshClaudeIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("claudeIntegrationMessage", "");
+  const request = beginIntegrationCheck(claudeIntegration);
+  if (!request) return;
   renderClaudeIntegration();
-  integrationMessage("claudeIntegrationMessage", "");
   try {
+    if (retry) await api(`${claudeIntegrationPath}/refresh`, { method: "POST" });
     const result = await api(claudeIntegrationPath);
+    if (!currentIntegrationCheck(claudeIntegration, request)) return;
     claudeIntegration.connected = result.connected;
     claudeIntegration.paths = result.paths;
+    claudeIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("claudeIntegrationMessage", result.update.message, true);
+    else if (byId("claudeIntegrationMessage").classList.contains("error")) integrationMessage("claudeIntegrationMessage", "");
   } catch (error) {
+    if (!currentIntegrationCheck(claudeIntegration, request)) return;
     claudeIntegration.connected = null;
+    claudeIntegration.update = null;
     integrationMessage("claudeIntegrationMessage", error.message, true);
   } finally {
-    claudeIntegration.busy = false;
-    renderClaudeIntegration();
+    finishIntegrationCheck(claudeIntegration, request, renderClaudeIntegration);
   }
 }
 
 byId("openClaudeIntegration").addEventListener("click", () => {
   if (claudeIntegration.connected === null) {
-    refreshClaudeIntegration();
+    refreshClaudeIntegration(claudeIntegration.update?.state === "failed");
     return;
   }
   integrationMessage("claudeIntegrationDialogMessage", "");
   claudeIntegrationDialog.showModal();
 });
 byId("confirmClaudeIntegration").addEventListener("click", async () => {
-  if (claudeIntegration.busy || claudeIntegration.connected === null) return;
+  if (byId("confirmClaudeIntegration").disabled) return;
   const disconnect = claudeIntegration.connected;
   claudeIntegration.busy = true;
   renderClaudeIntegration();
@@ -1547,6 +1708,7 @@ byId("confirmClaudeIntegration").addEventListener("click", async () => {
   try {
     const result = await api(`${claudeIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
     claudeIntegration.connected = result.connected;
+    claudeIntegration.update = null;
     claudeIntegrationDialog.close();
     integrationMessage("claudeIntegrationMessage", disconnect
       ? "Settings removed. Reload VS Code to disconnect."
@@ -1568,15 +1730,114 @@ claudeIntegrationDialog.addEventListener("click", (event) => {
   }
 });
 
+const vscodeChatIntegrationDialog = byId("vscodeChatIntegrationDialog");
+const vscodeChatIntegration = { connected: null, busy: false, paths: null, update: null };
+const vscodeChatIntegrationPath = "/admin/api/integrations/vscode-chat";
+
+function renderVSCodeChatIntegration() {
+  const { connected, paths } = vscodeChatIntegration;
+  const busy = vscodeChatIntegration.busy || integrationUpdating(vscodeChatIntegration, "vscode-chat");
+  byId("retryVSCodeChatIntegration").hidden = connected === null || vscodeChatIntegration.update?.state !== "failed";
+  byId("retryVSCodeChatIntegration").disabled = busy;
+  const action = connected ? "Disconnect" : "Connect";
+  byId("openVSCodeChatIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
+  byId("openVSCodeChatIntegration").disabled = busy;
+  byId("openVSCodeChatIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmVSCodeChatIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmVSCodeChatIntegration").disabled = busy || connected === null;
+  byId("openVSCodeChatIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmVSCodeChatIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("vscodeChatIntegrationDescription").textContent = connected
+    ? "Remove FCC's model group from VS Code Chat."
+    : "Add FCC models to VS Code Chat. Your selected models stay unchanged.";
+  const files = byId("vscodeChatIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = [paths.vscode_models];
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshVSCodeChatIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("vscodeChatIntegrationMessage", "");
+  const request = beginIntegrationCheck(vscodeChatIntegration);
+  if (!request) return;
+  renderVSCodeChatIntegration();
+  try {
+    if (retry) await api(`${vscodeChatIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(vscodeChatIntegrationPath);
+    if (!currentIntegrationCheck(vscodeChatIntegration, request)) return;
+    vscodeChatIntegration.connected = result.connected;
+    vscodeChatIntegration.paths = result.paths;
+    vscodeChatIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("vscodeChatIntegrationMessage", result.update.message, true);
+    else if (byId("vscodeChatIntegrationMessage").classList.contains("error")) integrationMessage("vscodeChatIntegrationMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(vscodeChatIntegration, request)) return;
+    vscodeChatIntegration.connected = null;
+    vscodeChatIntegration.update = null;
+    integrationMessage("vscodeChatIntegrationMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(vscodeChatIntegration, request, renderVSCodeChatIntegration);
+  }
+}
+
+byId("openVSCodeChatIntegration").addEventListener("click", () => {
+  if (vscodeChatIntegration.connected === null) {
+    refreshVSCodeChatIntegration(true);
+    return;
+  }
+  integrationMessage("vscodeChatIntegrationDialogMessage", "");
+  vscodeChatIntegrationDialog.showModal();
+});
+byId("retryVSCodeChatIntegration").addEventListener("click", () => refreshVSCodeChatIntegration(true));
+byId("confirmVSCodeChatIntegration").addEventListener("click", async () => {
+  if (byId("confirmVSCodeChatIntegration").disabled) return;
+  const disconnect = vscodeChatIntegration.connected;
+  vscodeChatIntegration.busy = true;
+  renderVSCodeChatIntegration();
+  integrationMessage("vscodeChatIntegrationDialogMessage", "");
+  integrationMessage("vscodeChatIntegrationMessage", "");
+  try {
+    const result = await api(`${vscodeChatIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    vscodeChatIntegration.connected = result.connected;
+    vscodeChatIntegration.update = null;
+    vscodeChatIntegrationDialog.close();
+    integrationMessage("vscodeChatIntegrationMessage", disconnect
+      ? "Settings removed. Reload VS Code to disconnect."
+      : "Models saved. Select an FCC model in VS Code Chat. Reload VS Code if needed.");
+  } catch (error) {
+    integrationMessage("vscodeChatIntegrationDialogMessage", error.message, true);
+    integrationMessage("vscodeChatIntegrationMessage", error.message, true);
+  } finally {
+    vscodeChatIntegration.busy = false;
+    renderVSCodeChatIntegration();
+  }
+});
+byId("closeVSCodeChatIntegration").addEventListener("click", () => vscodeChatIntegrationDialog.close());
+vscodeChatIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== vscodeChatIntegrationDialog) return;
+  const bounds = vscodeChatIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    vscodeChatIntegrationDialog.close();
+  }
+});
+
 const codexIntegrationDialog = byId("codexIntegrationDialog");
-const codexIntegration = { connected: null, busy: false, paths: null };
+const codexIntegration = { connected: null, busy: false, paths: null, update: null };
 const codexIntegrationPath = "/admin/api/integrations/codex";
 
 function renderCodexIntegration() {
   const { connected, paths } = codexIntegration;
   const initializing = connected === false && state.startup?.startup?.catalog_file === "starting";
   const unavailable = connected === false && state.startup?.startup?.catalog_file === "failed";
-  const busy = codexIntegration.busy || initializing;
+  const busy = codexIntegration.busy || initializing || integrationUpdating(codexIntegration, "codex");
   const catalogError = "Could not prepare the Codex model catalog. Refresh models to retry.";
   if (unavailable) integrationMessage("codexIntegrationMessage", catalogError, true);
   else if (byId("codexIntegrationMessage").textContent === catalogError) integrationMessage("codexIntegrationMessage", "");
@@ -1605,34 +1866,40 @@ function renderCodexIntegration() {
   }
 }
 
-async function refreshCodexIntegration() {
-  if (codexIntegration.busy) return;
-  codexIntegration.busy = true;
+async function refreshCodexIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("codexIntegrationMessage", "");
+  const request = beginIntegrationCheck(codexIntegration);
+  if (!request) return;
   renderCodexIntegration();
-  integrationMessage("codexIntegrationMessage", "");
   try {
+    if (retry) await api(`${codexIntegrationPath}/refresh`, { method: "POST" });
     const result = await api(codexIntegrationPath);
+    if (!currentIntegrationCheck(codexIntegration, request)) return;
     codexIntegration.connected = result.connected;
     codexIntegration.paths = result.paths;
+    codexIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("codexIntegrationMessage", result.update.message, true);
+    else if (byId("codexIntegrationMessage").classList.contains("error")) integrationMessage("codexIntegrationMessage", "");
   } catch (error) {
+    if (!currentIntegrationCheck(codexIntegration, request)) return;
     codexIntegration.connected = null;
+    codexIntegration.update = null;
     integrationMessage("codexIntegrationMessage", error.message, true);
   } finally {
-    codexIntegration.busy = false;
-    renderCodexIntegration();
+    finishIntegrationCheck(codexIntegration, request, renderCodexIntegration);
   }
 }
 
 byId("openCodexIntegration").addEventListener("click", () => {
   if (codexIntegration.connected === null) {
-    refreshCodexIntegration();
+    refreshCodexIntegration(codexIntegration.update?.state === "failed");
     return;
   }
   integrationMessage("codexIntegrationDialogMessage", "");
   codexIntegrationDialog.showModal();
 });
 byId("confirmCodexIntegration").addEventListener("click", async () => {
-  if (codexIntegration.busy || codexIntegration.connected === null) return;
+  if (byId("confirmCodexIntegration").disabled) return;
   const disconnect = codexIntegration.connected;
   codexIntegration.busy = true;
   renderCodexIntegration();
@@ -1642,6 +1909,7 @@ byId("confirmCodexIntegration").addEventListener("click", async () => {
     const result = await api(`${codexIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
     codexIntegration.connected = result.connected;
     codexIntegration.paths = result.paths;
+    codexIntegration.update = null;
     codexIntegrationDialog.close();
     integrationMessage("codexIntegrationMessage", disconnect
       ? "Settings removed. Restart Codex to disconnect."
@@ -1664,13 +1932,329 @@ codexIntegrationDialog.addEventListener("click", (event) => {
 });
 
 const jetBrainsIntegrationDialog = byId("jetBrainsIntegrationDialog");
-byId("openJetBrainsIntegration").addEventListener("click", () => jetBrainsIntegrationDialog.showModal());
+const jetBrainsIntegration = { connected: null, busy: false, paths: null, update: null };
+const jetBrainsIntegrationPath = "/admin/api/integrations/jetbrains-acp";
+
+function renderJetBrainsIntegration() {
+  const { connected, paths } = jetBrainsIntegration;
+  const busy = jetBrainsIntegration.busy || integrationUpdating(jetBrainsIntegration, "jetbrains-acp");
+  const action = connected ? "Disconnect" : "Connect";
+  byId("openJetBrainsIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
+  byId("openJetBrainsIntegration").disabled = busy;
+  byId("openJetBrainsIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmJetBrainsIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmJetBrainsIntegration").disabled = busy || connected === null;
+  byId("openJetBrainsIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmJetBrainsIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("jetBrainsIntegrationDescription").textContent = connected
+    ? "Remove the Claude Code (FCC) agent, including its custom settings. Finish any configuration edits first."
+    : "Add Claude Code (FCC) using JetBrains' installed Claude Agent. Start that agent once before connecting, and finish any configuration edits.";
+  const files = byId("jetBrainsIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = [paths.acp_config];
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshJetBrainsIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("jetBrainsIntegrationMessage", "");
+  const request = beginIntegrationCheck(jetBrainsIntegration);
+  if (!request) return;
+  renderJetBrainsIntegration();
+  try {
+    if (retry) await api(`${jetBrainsIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(jetBrainsIntegrationPath);
+    if (!currentIntegrationCheck(jetBrainsIntegration, request)) return;
+    jetBrainsIntegration.connected = result.connected;
+    jetBrainsIntegration.paths = result.paths;
+    jetBrainsIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("jetBrainsIntegrationMessage", result.update.message, true);
+    else if (byId("jetBrainsIntegrationMessage").classList.contains("error")) integrationMessage("jetBrainsIntegrationMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(jetBrainsIntegration, request)) return;
+    jetBrainsIntegration.connected = null;
+    jetBrainsIntegration.update = null;
+    integrationMessage("jetBrainsIntegrationMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(jetBrainsIntegration, request, renderJetBrainsIntegration);
+  }
+}
+
+byId("openJetBrainsIntegration").addEventListener("click", () => {
+  if (jetBrainsIntegration.connected === null) {
+    refreshJetBrainsIntegration(jetBrainsIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("jetBrainsIntegrationDialogMessage", "");
+  jetBrainsIntegrationDialog.showModal();
+});
+byId("confirmJetBrainsIntegration").addEventListener("click", async () => {
+  if (byId("confirmJetBrainsIntegration").disabled) return;
+  const disconnect = jetBrainsIntegration.connected;
+  jetBrainsIntegration.busy = true;
+  renderJetBrainsIntegration();
+  integrationMessage("jetBrainsIntegrationDialogMessage", "");
+  integrationMessage("jetBrainsIntegrationMessage", "");
+  try {
+    const result = await api(`${jetBrainsIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    jetBrainsIntegration.connected = result.connected;
+    jetBrainsIntegration.update = null;
+    jetBrainsIntegrationDialog.close();
+    integrationMessage("jetBrainsIntegrationMessage", disconnect
+      ? "Agent removed. Reopen JetBrains to disconnect."
+      : "Settings saved. Reopen JetBrains, select Claude Code (FCC), and start a new chat.");
+  } catch (error) {
+    integrationMessage("jetBrainsIntegrationDialogMessage", error.message, true);
+    integrationMessage("jetBrainsIntegrationMessage", error.message, true);
+  } finally {
+    jetBrainsIntegration.busy = false;
+    renderJetBrainsIntegration();
+  }
+});
 byId("closeJetBrainsIntegration").addEventListener("click", () => jetBrainsIntegrationDialog.close());
 jetBrainsIntegrationDialog.addEventListener("click", (event) => {
   if (event.target !== jetBrainsIntegrationDialog) return;
   const bounds = jetBrainsIntegrationDialog.getBoundingClientRect();
   if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
     jetBrainsIntegrationDialog.close();
+  }
+});
+
+const claudeDesktopIntegrationDialog = byId("claudeDesktopIntegrationDialog");
+const claudeDesktopIntegration = { connected: null, disconnectPending: false, busy: false, paths: null, update: null };
+const claudeDesktopIntegrationPath = "/admin/api/integrations/claude-desktop";
+
+function renderClaudeDesktopIntegration() {
+  const { connected, paths, disconnectPending } = claudeDesktopIntegration;
+  const busy = claudeDesktopIntegration.busy || integrationUpdating(claudeDesktopIntegration, "claude-desktop");
+  const disconnect = disconnectPending || connected;
+  const action = disconnectPending ? "Retry disconnect" : connected ? "Disconnect" : "Connect";
+  byId("openClaudeDesktopIntegration").textContent = busy ? "Loading…" : connected === null && !disconnectPending ? "Retry" : action;
+  byId("openClaudeDesktopIntegration").disabled = busy;
+  byId("openClaudeDesktopIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmClaudeDesktopIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmClaudeDesktopIntegration").disabled = busy || (connected === null && !disconnectPending);
+  byId("openClaudeDesktopIntegration").className = disconnect && !busy ? "danger-button" : "primary-button";
+  byId("confirmClaudeDesktopIntegration").className = disconnect ? "danger-button" : "primary-button";
+  byId("claudeDesktopIntegrationDescription").textContent = disconnectPending
+    ? "Finish removing FCC's configuration. Fully quit Claude Desktop before retrying, then reopen it."
+    : connected
+    ? "Remove FCC's configuration and return to normal Claude sign-in. Fully quit Claude Desktop first, then reopen it."
+    : "Set FCC as Claude Desktop's gateway. Fully quit Claude Desktop before connecting, then reopen it.";
+  const files = byId("claudeDesktopIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = Object.values(paths);
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshClaudeDesktopIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("claudeDesktopIntegrationMessage", "");
+  const request = beginIntegrationCheck(claudeDesktopIntegration);
+  if (!request) return;
+  renderClaudeDesktopIntegration();
+  try {
+    if (retry) await api(`${claudeDesktopIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(claudeDesktopIntegrationPath);
+    if (!currentIntegrationCheck(claudeDesktopIntegration, request)) return;
+    claudeDesktopIntegration.connected = result.connected;
+    claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
+    claudeDesktopIntegration.paths = result.paths;
+    claudeDesktopIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("claudeDesktopIntegrationMessage", result.update.message, true);
+    else if (byId("claudeDesktopIntegrationMessage").classList.contains("error")) integrationMessage("claudeDesktopIntegrationMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(claudeDesktopIntegration, request)) return;
+    claudeDesktopIntegration.connected = null;
+    claudeDesktopIntegration.disconnectPending = false;
+    claudeDesktopIntegration.update = null;
+    integrationMessage("claudeDesktopIntegrationMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(claudeDesktopIntegration, request, renderClaudeDesktopIntegration);
+  }
+}
+
+byId("openClaudeDesktopIntegration").addEventListener("click", () => {
+  if (claudeDesktopIntegration.connected === null && !claudeDesktopIntegration.disconnectPending) {
+    refreshClaudeDesktopIntegration(claudeDesktopIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("claudeDesktopIntegrationDialogMessage", "");
+  claudeDesktopIntegrationDialog.showModal();
+});
+byId("confirmClaudeDesktopIntegration").addEventListener("click", async () => {
+  if (byId("confirmClaudeDesktopIntegration").disabled) return;
+  const disconnect = claudeDesktopIntegration.disconnectPending || claudeDesktopIntegration.connected;
+  claudeDesktopIntegration.busy = true;
+  renderClaudeDesktopIntegration();
+  integrationMessage("claudeDesktopIntegrationDialogMessage", "");
+  integrationMessage("claudeDesktopIntegrationMessage", "");
+  try {
+    const result = await api(`${claudeDesktopIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    claudeDesktopIntegration.connected = result.connected;
+    claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
+    claudeDesktopIntegration.paths = result.paths;
+    claudeDesktopIntegration.update = null;
+    claudeDesktopIntegrationDialog.close();
+    integrationMessage("claudeDesktopIntegrationMessage", disconnect
+      ? "Settings removed. Reopen Claude Desktop to disconnect."
+      : "Settings saved. Reopen Claude Desktop to connect.");
+  } catch (error) {
+    if (disconnect) {
+      try {
+        const result = await api(claudeDesktopIntegrationPath);
+        claudeDesktopIntegration.connected = result.connected;
+        claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
+        claudeDesktopIntegration.paths = result.paths;
+        claudeDesktopIntegration.update = result.update;
+      } catch {
+        // Keep the user's disconnect action available if status is unreadable too.
+      }
+    }
+    integrationMessage("claudeDesktopIntegrationDialogMessage", error.message, true);
+    integrationMessage("claudeDesktopIntegrationMessage", error.message, true);
+  } finally {
+    claudeDesktopIntegration.busy = false;
+    renderClaudeDesktopIntegration();
+  }
+});
+byId("closeClaudeDesktopIntegration").addEventListener("click", () => claudeDesktopIntegrationDialog.close());
+claudeDesktopIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== claudeDesktopIntegrationDialog) return;
+  const bounds = claudeDesktopIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    claudeDesktopIntegrationDialog.close();
+  }
+});
+
+const dshDesktopIntegrationDialog = byId("dshDesktopIntegrationDialog");
+const dshDesktopIntegration = { connected: null, actionRevision: 0, busy: false, paths: null, update: null };
+const dshDesktopIntegrationPath = "/admin/api/integrations/dsh-desktop";
+
+function applyDshDesktopStatus(result) {
+  dshDesktopIntegration.connected = result.connected;
+  dshDesktopIntegration.paths = result.paths ?? dshDesktopIntegration.paths;
+  dshDesktopIntegration.update = result.update ?? null;
+}
+
+function renderDshDesktopIntegration() {
+  const { connected, paths } = dshDesktopIntegration;
+  const updating = integrationUpdating(dshDesktopIntegration, "dsh-desktop");
+  const busy = dshDesktopIntegration.busy || (updating && !connected);
+  byId("retryDshDesktopIntegration").hidden = dshDesktopIntegration.update?.state !== "failed";
+  byId("retryDshDesktopIntegration").disabled = busy || updating;
+  const action = connected === null ? "Retry" : connected ? "Disconnect" : "Connect";
+  byId("openDshDesktopIntegration").textContent = busy ? "Loading…" : action;
+  byId("openDshDesktopIntegration").disabled = busy;
+  byId("openDshDesktopIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmDshDesktopIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmDshDesktopIntegration").disabled = busy || connected === null;
+  byId("openDshDesktopIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmDshDesktopIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("dshDesktopIntegrationDescription").textContent = connected
+    ? "Remove FCC's Desktop connection. Existing FCC sessions need another model selected to continue."
+    : "Install and open DSH Desktop once, then connect FCC as the default for new sessions.";
+  const files = byId("dshDesktopIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = Object.values(paths);
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshDshDesktopIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("dshDesktopIntegrationMessage", "");
+  const request = beginIntegrationCheck(dshDesktopIntegration);
+  if (!request) return;
+  renderDshDesktopIntegration();
+  try {
+    if (retry) await api(`${dshDesktopIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(dshDesktopIntegrationPath);
+    if (!currentIntegrationCheck(dshDesktopIntegration, request)) return;
+    applyDshDesktopStatus(result);
+    if (result.update?.state === "failed") integrationMessage("dshDesktopIntegrationMessage", result.update.message, true);
+    else if (byId("dshDesktopIntegrationMessage").classList.contains("error")) integrationMessage("dshDesktopIntegrationMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(dshDesktopIntegration, request)) return;
+    integrationMessage("dshDesktopIntegrationMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(dshDesktopIntegration, request, renderDshDesktopIntegration);
+  }
+}
+
+byId("openDshDesktopIntegration").addEventListener("click", () => {
+  if (dshDesktopIntegration.connected === null) {
+    refreshDshDesktopIntegration(dshDesktopIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("dshDesktopIntegrationDialogMessage", "");
+  dshDesktopIntegrationDialog.showModal();
+});
+byId("confirmDshDesktopIntegration").addEventListener("click", async () => {
+  if (byId("confirmDshDesktopIntegration").disabled) return;
+  const disconnect = dshDesktopIntegration.connected === true;
+  const config = state.config;
+  const actionRevision = ++dshDesktopIntegration.actionRevision;
+  const current = () => config === state.config && actionRevision === dshDesktopIntegration.actionRevision;
+  dshDesktopIntegration.checkRequest = null;
+  dshDesktopIntegration.busy = true;
+  renderDshDesktopIntegration();
+  integrationMessage("dshDesktopIntegrationDialogMessage", "");
+  integrationMessage("dshDesktopIntegrationMessage", "");
+  try {
+    const result = await api(`${dshDesktopIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    if (!current()) return;
+    applyDshDesktopStatus(result);
+    dshDesktopIntegrationDialog.close();
+    integrationMessage("dshDesktopIntegrationMessage", result.connected
+      ? "Connected. New DSH sessions use FCC. Reopen DSH if it does not reload the changes."
+      : "DSH Desktop is disconnected. Select another model in existing DSH sessions.");
+  } catch (error) {
+    if (!current()) return;
+    try {
+      const result = await api(dshDesktopIntegrationPath);
+      if (!current()) return;
+      applyDshDesktopStatus(result);
+    } catch {
+      // Keep the last known status if the follow-up read also fails.
+    }
+    if (!current()) return;
+    integrationMessage("dshDesktopIntegrationDialogMessage", error.message, true);
+    integrationMessage("dshDesktopIntegrationMessage", error.message, true);
+  } finally {
+    if (actionRevision !== dshDesktopIntegration.actionRevision) return;
+    dshDesktopIntegration.busy = false;
+    renderDshDesktopIntegration();
+    if (config !== state.config) void refreshDshDesktopIntegration();
+  }
+});
+byId("retryDshDesktopIntegration").addEventListener("click", () => refreshDshDesktopIntegration(true));
+byId("closeDshDesktopIntegration").addEventListener("click", () => dshDesktopIntegrationDialog.close());
+dshDesktopIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== dshDesktopIntegrationDialog) return;
+  const bounds = dshDesktopIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    dshDesktopIntegrationDialog.close();
   }
 });
 

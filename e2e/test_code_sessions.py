@@ -435,14 +435,11 @@ def test_pending_child_review_outside_page_survives_refresh_in_both_tabs(
     send(page, "Continue")
     code_control.run(code_control.harness.wait_inputs(2))
 
-    async def more_output():
-        for index in range(55):
-            await connection.text(
-                "turn-2", str(index), f"Output {index}", complete=True
-            )
-        await connection.finish("turn-2")
-
-    code_control.run(more_output())
+    for index in range(55):
+        code_control.run(
+            connection.text("turn-2", str(index), f"Output {index}", complete=True)
+        )
+    code_control.run(connection.finish("turn-2"))
     page.reload()
     second = context.new_page()
     try:
@@ -514,14 +511,11 @@ def test_reobserved_child_review_outside_page_appears_without_refresh(
     code_control.run(code_control.harness.wait_inputs(2))
     replacement = code_control.harness.connections[-1]
 
-    async def more_output():
-        for index in range(55):
-            await replacement.text(
-                "turn-2", str(index), f"Output {index}", complete=True
-            )
-        await replacement.finish("turn-2")
-
-    code_control.run(more_output())
+    for index in range(55):
+        code_control.run(
+            replacement.text("turn-2", str(index), f"Output {index}", complete=True)
+        )
+    code_control.run(replacement.finish("turn-2"))
     page.reload()
     second = context.new_page()
     try:
@@ -603,12 +597,18 @@ def test_settings_apply_preserves_open_creation_and_picker(
     page, admin_base_url, tmp_path, code_control
 ):
     pending = []
-    page.route("**/admin/api/config/apply", lambda route: pending.append(route))
+
+    def capture_apply(route):
+        pending.append(route)
+        page.evaluate("window.applyRequestIntercepted = true")
+
+    page.route("**/admin/api/config/apply", capture_apply)
     page.goto(f"{admin_base_url}/admin")
     expect(page.locator("#messageArea")).to_have_text("")
     page.locator("#field-PORT").fill("8081")
     page.get_by_role("button", name="Apply", exact=True).click()
     expect(page.locator("#messageArea")).to_have_text("Applying…")
+    page.wait_for_function("window.applyRequestIntercepted === true")
     assert len(pending) == 1
     page.get_by_role("button", name="Code sessions", exact=True).click()
     page.get_by_role("button", name="New code session", exact=True).click()
@@ -871,13 +871,20 @@ def test_existing_session_keeps_streaming_while_folder_picker_is_open(
         observer.close()
 
 
+def pause_clock(page):
+    # Freeze wall time first so pausing cannot target the past on a busy runner.
+    page.clock.set_fixed_time(1000)
+    page.clock.pause_at(1000)
+    # Let Date.now advance with run_for once the clock is paused.
+    page.clock.set_system_time(1000)
+
+
 @pytest.mark.parametrize("terminal", ["completed", "failed", "interrupted"])
 def test_thinking_fills_quiet_gaps_without_changing_transcript(
     page, admin_base_url, tmp_path, code_control, terminal
 ):
     create_session(page, admin_base_url, tmp_path)
-    page.clock.install(time=1000)
-    page.clock.pause_at(1000)
+    pause_clock(page)
     send(page, "Inspect this project")
     connection = code_control.connection()
     expect(page.locator("#codeStop")).to_be_visible()
@@ -934,8 +941,7 @@ def test_recovered_output_restarts_thinking_quiet_interval(
 ):
     control_feed(page)
     create_session(page, admin_base_url, tmp_path)
-    page.clock.install(time=1000)
-    page.clock.pause_at(1000)
+    pause_clock(page)
     send(page, "Inspect")
     connection = code_control.connection()
     code_control.run(
@@ -968,8 +974,7 @@ def test_thinking_respects_prompts_refresh_navigation_and_stop(
 ):
     control_feed(page)
     url = create_session(page, admin_base_url, tmp_path)
-    page.clock.install(time=1000)
-    page.clock.pause_at(1000)
+    pause_clock(page)
     send(page, "Inspect")
     connection = code_control.connection()
     code_control.run(connection.prompt(0))
@@ -1037,8 +1042,7 @@ def test_thinking_preserves_expanded_items_and_scroll_position(
     page, admin_base_url, tmp_path, code_control
 ):
     create_session(page, admin_base_url, tmp_path)
-    page.clock.install(time=1000)
-    page.clock.pause_at(1000)
+    pause_clock(page)
     send(page, "Inspect")
     connection = code_control.connection()
     code_control.run(connection.text("turn-1", "reason", "Reading", kind="reasoning"))
@@ -1239,6 +1243,7 @@ def test_competing_tabs_keep_the_rejected_draft(
         expect(second.get_by_role("textbox", name="Message", exact=True)).to_have_value(
             "Second tab draft"
         )
+        code_control.run(code_control.harness.wait_inputs(1))
         assert (
             sum(
                 len(connection.inputs)
@@ -1721,7 +1726,13 @@ def test_off_clears_effort_when_reasoning_becomes_unavailable(
 ):
     url = create_session(page, admin_base_url, tmp_path)
     effort = page.locator("#codeReasoning")
-    effort.select_option("high")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH" and "/api/code/sessions/" in response.url
+        )
+    ) as changed:
+        effort.select_option("high")
+    assert changed.value.json()["reasoning_effort"] == "high"
     expect(effort).to_be_enabled()
     page.locator("#codeComposer").fill("Preserve this draft")
     code_control.harness.efforts = ("off",)
@@ -1923,6 +1934,7 @@ def test_unavailable_feed_shows_reason_and_clears_it_on_recovery(
     page, admin_base_url, code_control
 ):
     async def availability(available):
+        await code_control.service.start()
         code_control.service._accepting = available
         code_control.service._message = (
             None if available else "Code storage is unavailable"
@@ -2043,21 +2055,23 @@ def test_library_reconnect_removes_missed_deletion_and_searches_beyond_first_pag
 ):
     control_feed(page)
 
-    async def seed():
-        first = await code_control.service.create_session(
-            str(uuid.uuid4()), str(tmp_path)
-        )
-        await code_control.service.update_settings(
-            first.id, first.revision, {"title": "Needle project"}
-        )
-        for _ in range(26):
-            await code_control.service.create_session(str(uuid.uuid4()), str(tmp_path))
-        return first.id
-
     # Start the isolated service before seeding it.
     page.goto(f"{admin_base_url}/admin/code")
     expect(page.locator("#codeNew")).to_be_enabled()
-    session_id = code_control.run(seed())
+    # Bound each operation, not the cumulative cost of filling a whole page.
+    first = code_control.run(
+        code_control.service.create_session(str(uuid.uuid4()), str(tmp_path))
+    )
+    code_control.run(
+        code_control.service.update_settings(
+            first.id, first.revision, {"title": "Needle project"}
+        )
+    )
+    for _ in range(26):
+        code_control.run(
+            code_control.service.create_session(str(uuid.uuid4()), str(tmp_path))
+        )
+    session_id = first.id
     page.get_by_role("searchbox", name="Search titles and folders").fill("Needle")
     expect(page.locator(".session-card")).to_have_count(1)
     expect(page.locator(".session-card")).to_contain_text("Needle project")

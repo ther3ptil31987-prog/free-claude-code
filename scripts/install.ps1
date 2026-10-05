@@ -1,7 +1,5 @@
 param(
-    [switch] $VoiceNim,
     [switch] $VoiceLocal,
-    [switch] $VoiceAll,
     [string] $TorchBackend = "",
     [switch] $Rtk,
     [switch] $DryRun,
@@ -14,17 +12,16 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$RepoArchiveUrl = "https://github.com/Alishahryar1/free-claude-code/archive/refs/heads/main.zip"
 # Windows on ARM emulates x64, whose Python package ecosystem has broader wheel support.
-$PythonRequest = "cpython-3.14.0-windows-x86_64-none"
+$PythonRequest = "cpython-3.14.7-windows-x86_64-none"
 $MinUvVersion = "0.12.13"
 $ClaudeInstallUrl = "https://claude.ai/install.ps1"
 $CodexInstallUrl = "https://chatgpt.com/codex/install.ps1"
 $PiInstallUrl = "https://pi.dev/install.ps1"
-$OpenCodeReleaseBaseUrl = "https://github.com/anomalyco/opencode/releases/latest/download"
+$OpenCodeReleaseBaseUrl = "https://opencode.ai/files/bin"
 $HermesInstallUrl = "https://hermes-agent.nousresearch.com/install.ps1"
-$DshVersion = "0.1.0-rc.8"
-$DshPackage = "@deepseek-ai/dsh@$DshVersion"
+$DshMinimumVersion = "0.2.0-rc.2"
+$DshPackage = "@deepseek-ai/dsh@latest"
 $GrokInstallUrl = "https://x.ai/cli/install.ps1"
 $MuseInstallUrl = "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install-muse.ps1"
 $RtkVersion = "0.44.2"
@@ -59,6 +56,8 @@ $FccCommands = @(
     "fcc-grok",
     "fcc-muse",
     "fcc-aider",
+    "fcc-doctor",
+    "fcc-update",
     "fcc-init",
     "free-claude-code"
 )
@@ -70,9 +69,7 @@ Usage: install.ps1 [options]
 Installs or updates Free Claude Code and lets you choose which coding agents to install or verify.
 
 Options:
-  -VoiceNim              Install NVIDIA NIM voice transcription support.
   -VoiceLocal            Install local Whisper voice transcription support.
-  -VoiceAll              Install all voice transcription backends.
   -TorchBackend VALUE    Use a uv PyTorch backend, such as cu130. Requires local voice.
   -Rtk                   Install and configure RTK for the selected coding agents.
   -DryRun                Print commands without running them.
@@ -113,29 +110,92 @@ function Read-YesNo {
     }
 }
 
+function Find-InstalledCodingAgent {
+    param([string] $CommandName)
+
+    $originalPath = $env:Path
+    try {
+        if ($CommandName -eq "opencode" -and $script:OriginalOpenCode) {
+            return $script:OriginalOpenCode
+        }
+        if ($CommandName -in @("pi", "cline", "dsh")) {
+            try {
+                Add-NpmBinDirectories
+            }
+            catch {
+                # An optional lookup must not prevent choosing other harnesses.
+            }
+        }
+        $command = Get-ApplicationCommand $CommandName
+        if (-not $command) {
+            if ($CommandName -eq "aider") {
+                if ($env:UV_TOOL_BIN_DIR) {
+                    Add-PathEntry $env:UV_TOOL_BIN_DIR
+                }
+                elseif ($env:XDG_BIN_HOME) {
+                    Add-PathEntry $env:XDG_BIN_HOME
+                }
+                elseif ($env:XDG_DATA_HOME) {
+                    Add-PathEntry (Join-Path $env:XDG_DATA_HOME "..\bin")
+                }
+                elseif ($env:USERPROFILE) {
+                    Add-PathEntry (Join-Path $env:USERPROFILE ".local\bin")
+                }
+                $command = Get-ApplicationCommand $CommandName
+            }
+            elseif ($CommandName -eq "muse") {
+                $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+                if (-not [string]::IsNullOrWhiteSpace($userPath)) {
+                    $env:Path = "$originalPath$([IO.Path]::PathSeparator)$userPath"
+                    $command = Get-ApplicationCommand $CommandName
+                }
+            }
+        }
+        if ($CommandName -eq "pi" -and $command -and (-not $DryRun)) {
+            if (-not (Test-PiApplication $command)) {
+                return $null
+            }
+        }
+        return $command
+    }
+    finally {
+        # Environment variables are process-wide, even inside a function.
+        $env:Path = $originalPath
+    }
+}
+
+function Read-CodingAgentSelection {
+    param(
+        [string] $CommandName,
+        [string] $DisplayName,
+        [string] $FccCommand,
+        [bool] $DefaultYes = $true
+    )
+
+    if (Find-InstalledCodingAgent $CommandName) {
+        Write-Host "$DisplayName already installed; will verify."
+        return $true
+    }
+    return Read-YesNo -Prompt "Install $DisplayName for ${FccCommand}?" -DefaultYes $DefaultYes
+}
+
 function Select-CodingAgents {
     while ($true) {
-        $script:InstallClaudeCode = Read-YesNo "Install or verify Claude Code for fcc-claude?"
-        $script:InstallCodex = Read-YesNo "Install or verify Codex for fcc-codex?"
-        $script:InstallPi = Read-YesNo "Install or verify Pi for fcc-pi?"
-        $script:InstallOpenCode = Read-YesNo "Install or verify OpenCode for fcc-opencode?"
-        $script:InstallCline = Read-YesNo `
-            -Prompt "Install or verify Cline CLI for fcc-cline?" `
+        $script:InstallClaudeCode = Read-CodingAgentSelection claude "Claude Code" fcc-claude
+        $script:InstallCodex = Read-CodingAgentSelection codex Codex fcc-codex
+        $script:InstallPi = Read-CodingAgentSelection pi Pi fcc-pi
+        $script:InstallOpenCode = Read-CodingAgentSelection opencode OpenCode fcc-opencode
+        $script:InstallCline = Read-CodingAgentSelection cline "Cline CLI" fcc-cline `
             -DefaultYes $script:InstallCline
-        $script:InstallHermes = Read-YesNo `
-            -Prompt "Install or verify Hermes Agent for fcc-hermes?" `
+        $script:InstallHermes = Read-CodingAgentSelection hermes "Hermes Agent" fcc-hermes `
             -DefaultYes $script:InstallHermes
-        $script:InstallDsh = Read-YesNo `
-            -Prompt "Install or verify DeepSeek Harness for fcc-dsh?" `
+        $script:InstallDsh = Read-CodingAgentSelection dsh "DeepSeek Harness" fcc-dsh `
             -DefaultYes $script:InstallDsh
-        $script:InstallGrok = Read-YesNo `
-            -Prompt "Install or verify Grok Build for fcc-grok?" `
+        $script:InstallGrok = Read-CodingAgentSelection grok "Grok Build" fcc-grok `
             -DefaultYes $script:InstallGrok
-        $script:InstallMuse = Read-YesNo `
-            -Prompt "Install or verify Muse Code for fcc-muse?" `
+        $script:InstallMuse = Read-CodingAgentSelection muse "Muse Code" fcc-muse `
             -DefaultYes $script:InstallMuse
-        $script:InstallAider = Read-YesNo `
-            -Prompt "Install or verify Aider for fcc-aider?" `
+        $script:InstallAider = Read-CodingAgentSelection aider Aider fcc-aider `
             -DefaultYes $script:InstallAider
 
         if ($script:InstallClaudeCode -or $script:InstallCodex -or $script:InstallPi -or $script:InstallOpenCode -or $script:InstallCline -or $script:InstallHermes -or $script:InstallDsh -or $script:InstallGrok -or $script:InstallMuse -or $script:InstallAider) {
@@ -146,9 +206,15 @@ function Select-CodingAgents {
     }
 
     if (-not $script:EnableRtk) {
-        $script:EnableRtk = Read-YesNo `
-            -Prompt "Enable RTK token optimization globally for the selected coding agents?" `
-            -DefaultYes $false
+        if (Get-ApplicationCommand "rtk") {
+            Write-Host "RTK already installed; will verify."
+            $script:EnableRtk = $true
+        }
+        else {
+            $script:EnableRtk = Read-YesNo `
+                -Prompt "Enable RTK token optimization globally for the selected coding agents?" `
+                -DefaultYes $false
+        }
     }
 }
 
@@ -604,9 +670,6 @@ function Configure-RtkForSelectedAgents {
     if ($script:InstallPi -and $script:PiAvailable) {
         Invoke-RtkCommand -Arguments @("init", "--global", "--agent", "pi")
     }
-    if ($script:InstallOpenCode) {
-        Invoke-RtkCommand -Arguments @("init", "--global", "--opencode")
-    }
     if ($script:InstallCline) {
         Write-Host "Optional for each project: cd <project>; `$env:RTK_TELEMETRY_DISABLED='1'; rtk init --agent cline"
     }
@@ -701,6 +764,75 @@ function Test-SupportedStableVersion {
     return ([version] $normalizedVersion) -ge ([version] $normalizedMinimum)
 }
 
+function Read-OpenCodeVersionOutput {
+    param([string] $OpenCodePath)
+
+    $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("fcc-opencode-version-" + [guid]::NewGuid().ToString("N"))
+    $stdoutPath = Join-Path $temporaryRoot "stdout.txt"
+    $stderrPath = Join-Path $temporaryRoot "stderr.txt"
+    $process = $null
+    try {
+        New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+        $process = Start-Process -FilePath $OpenCodePath -ArgumentList @("--version") -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        # Windows PowerShell needs the handle retained to report the exit code.
+        [void] $process.Handle
+        if (-not $process.WaitForExit(10000)) {
+            & "$env:SYSTEMROOT\System32\taskkill.exe" /PID $process.Id /T /F *> $null
+            [void] $process.WaitForExit(5000)
+            throw "OpenCode version probe timed out at '$OpenCodePath'."
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "OpenCode version probe failed at '$OpenCodePath' (exit code $($process.ExitCode))."
+        }
+        return [IO.File]::ReadAllText($stdoutPath)
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+        Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-OpenCodeVersion {
+    param([string] $OpenCodePath)
+
+    $output = Read-OpenCodeVersionOutput $OpenCodePath
+    if ($output -match '(?m)^\s*(?:opencode(?:\s+version)?\s+)?v?(?<version>\d+\.\d+\.\d+(?:\+[0-9A-Za-z.-]+)?)\s*$') {
+        return $Matches["version"]
+    }
+    return ""
+}
+
+function Get-OpenCodeRtkPlugin {
+    $pluginPath = Join-Path $env:USERPROFILE ".config\opencode\plugins\rtk.ts"
+    try {
+        $plugin = Get-Item -LiteralPath $pluginPath -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return $null
+    }
+    if ($plugin.PSIsContainer -or ($plugin.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Disable or migrate the RTK plugin at '$pluginPath' manually, then rerun the installer."
+    }
+    # These include the backup's parent; a junction must not redirect either move.
+    foreach ($relativePath in @(".config", ".config\opencode", ".config\opencode\plugins")) {
+        $parent = Get-Item -LiteralPath (Join-Path $env:USERPROFILE $relativePath) -Force -ErrorAction Stop
+        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "The RTK plugin directory is linked: '$($parent.FullName)'. Disable or migrate it manually, then rerun the installer."
+        }
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($pluginPath))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    if ($hash -ne "6530c131946c84892f9522abd68d4e513e1e658d8ddbad1f59388c86ebbcb6bb") {
+        throw "The RTK plugin at '$pluginPath' was modified or is unrecognized. Disable or migrate it manually, then rerun the installer."
+    }
+    return $pluginPath
+}
+
 function Get-OpenCodeWindowsAssetName {
     $architecture = $env:PROCESSOR_ARCHITEW6432
     if ([string]::IsNullOrWhiteSpace($architecture)) {
@@ -719,15 +851,26 @@ function Get-OpenCodeWindowsAssetName {
     }
 }
 
+function Assert-NoOpenCodeProcessesRunning {
+    if (@(Get-Process -Name opencode,opencode2 -ErrorAction SilentlyContinue).Count -gt 0) {
+        throw "Close OpenCode before replacing its executable or RTK plugin, then rerun the installer."
+    }
+}
+
 function Install-OpenCode {
     $assetName = Get-OpenCodeWindowsAssetName
-    $archiveUrl = "$OpenCodeReleaseBaseUrl/$assetName"
     $installDirectory = Join-Path $env:USERPROFILE ".opencode\bin"
     if ($DryRun) {
-        Write-Host "+ irm $archiveUrl -OutFile <temporary-archive>"
+        Write-Host "+ resolve latest stable OpenCode 2 and download $assetName"
         Write-Host "+ extract and install opencode.exe to $(Format-Argument $installDirectory)"
         return
     }
+
+    $release = Invoke-RestMethod -Uri "https://opencode.ai/update/api/latest/cli/npm" -ErrorAction Stop
+    if ($release.version -isnot [string] -or $release.version -notmatch '^2\.\d+\.\d+$') {
+        throw "The OpenCode release channel did not return a stable OpenCode 2 version."
+    }
+    $archiveUrl = "$OpenCodeReleaseBaseUrl/$($release.version)/$assetName"
 
     $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("fcc-opencode-" + [guid]::NewGuid().ToString("N"))
     $archivePath = Join-Path $temporaryRoot $assetName
@@ -746,12 +889,17 @@ function Install-OpenCode {
         if ($executables.Count -ne 1) {
             throw "The OpenCode release archive did not contain exactly one opencode.exe."
         }
+        $version = Get-OpenCodeVersion $executables[0].FullName
+        if (($version -replace '\+.*$', '') -ne $release.version) {
+            throw "The OpenCode archive did not contain the selected stable version $($release.version)."
+        }
 
         New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
         Copy-Item -LiteralPath $executables[0].FullName -Destination $temporaryInstallPath
         if ((-not (Test-Path -LiteralPath $temporaryInstallPath -PathType Leaf)) -or ((Get-Item -LiteralPath $temporaryInstallPath).Length -eq 0)) {
             throw "The extracted OpenCode executable was empty."
         }
+        Assert-NoOpenCodeProcessesRunning
         Move-Item -LiteralPath $temporaryInstallPath -Destination (Join-Path $installDirectory "opencode.exe") -Force
     }
     finally {
@@ -761,16 +909,64 @@ function Install-OpenCode {
 }
 
 function Ensure-OpenCode {
-    $command = Get-ApplicationCommand "opencode"
-    if ($command) {
-        Write-Host "OpenCode already found on PATH; verifying it."
-    }
-    else {
-        Install-OpenCode
-        Add-KnownBinDirectories
+    $command = if ($script:OriginalOpenCode) { $script:OriginalOpenCode } else { Get-ApplicationCommand "opencode" }
+    $nativePath = Join-Path $env:USERPROFILE ".opencode\bin\opencode.exe"
+    if ($DryRun) {
+        Write-Host "+ opencode --version"
+        Write-Host "Install stable OpenCode 2 if absent, or migrate v1 at '$nativePath'; external v1 requires manual upgrade."
+        Write-Host "Check and back up the recognized old OpenCode RTK plugin if present."
+        if (-not $command) { Install-OpenCode }
+        return
     }
 
-    Confirm-Application -CommandName "opencode" -DisplayName "OpenCode"
+    $install = $true
+    if ($command) {
+        $version = Get-OpenCodeVersion $command.Source
+        if ($version -match '^2\.') {
+            $install = $false
+        }
+        elseif ($version -match '^1\.') {
+            if (-not (Test-EquivalentPath $command.Source $nativePath)) {
+                throw "OpenCode 1 at '$($command.Source)' requires manual migration. Remove it with its package manager (npm: npm uninstall -g opencode-ai), then rerun this installer. See https://opencode.ai/v2/docs/migrate-v1/"
+            }
+        }
+        else {
+            throw "OpenCode at '$($command.Source)' is not a recognized stable v1 or v2. Correct that installation, then rerun the installer. See https://opencode.ai/v2/docs/migrate-v1/"
+        }
+    }
+    $pluginPath = Get-OpenCodeRtkPlugin
+    if ($install -or $pluginPath) {
+        Assert-NoOpenCodeProcessesRunning
+    }
+    if ($install) {
+        foreach ($target in @((Join-Path $env:USERPROFILE ".opencode"), (Split-Path -Parent $nativePath), $nativePath)) {
+            $item = Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "OpenCode installation path is linked: '$target'. Migrate it manually."
+            }
+        }
+        Install-OpenCode
+        Add-KnownBinDirectories
+        if ((Get-OpenCodeVersion $nativePath) -notmatch '^2\.') {
+            throw "The OpenCode installer did not install stable OpenCode 2 at '$nativePath'."
+        }
+    }
+    # Check the command selected after the installer's PATH additions.
+    $command = Get-ApplicationCommand "opencode"
+    if (-not $command) { throw "OpenCode is not available on PATH after installation." }
+    $version = Get-OpenCodeVersion $command.Source
+    if ($version -notmatch '^2\.') {
+        throw "OpenCode at '$($command.Source)' is not stable OpenCode 2. Correct PATH, then rerun the installer."
+    }
+    Write-Host "Verified OpenCode $version at '$($command.Source)'."
+    if ($pluginPath) {
+        $pluginPath = Get-OpenCodeRtkPlugin
+        if (-not $pluginPath) { return }
+        $backupPath = Join-Path (Split-Path -Parent (Split-Path -Parent $pluginPath)) ("rtk-v1-" + [guid]::NewGuid().ToString("N") + ".bak")
+        Assert-NoOpenCodeProcessesRunning
+        Move-Item -LiteralPath $pluginPath -Destination $backupPath -ErrorAction Stop
+        Write-Host "OpenCode 2 RTK support is unavailable; the old plugin was saved at '$backupPath'."
+    }
 }
 
 function Ensure-Cline {
@@ -810,7 +1006,7 @@ function Install-Hermes {
     Invoke-DownloadedPowerShellInstaller `
         -Url $HermesInstallUrl `
         -Name "Hermes Agent" `
-        -ScriptArguments @("-NonInteractive", "-SkipSetup")
+        -ScriptArguments @("-NonInteractive")
     Add-KnownBinDirectories
 }
 
@@ -902,7 +1098,15 @@ function Ensure-Muse {
     $script:MuseAvailable = $false
     Invoke-DownloadedPowerShellInstaller -Url $MuseInstallUrl -Name "Muse Code"
     Add-KnownBinDirectories
-    Confirm-Application -CommandName "muse" -DisplayName "Muse Code"
+    $commandName = "muse"
+    if (-not $DryRun) {
+        $command = Find-InstalledCodingAgent "muse"
+        if (-not $command) {
+            throw "Muse Code was installed, but 'muse' is not available on PATH."
+        }
+        $commandName = $command.Source
+    }
+    Confirm-Application -CommandName $commandName -DisplayName "Muse Code"
     $script:MuseAvailable = $true
 }
 
@@ -910,11 +1114,45 @@ function Get-DshVersion {
     param([string] $DshPath)
 
     $output = Invoke-Utf8NativeCapture -FilePath $DshPath -Arguments @("--version")
-    $version = Convert-SemanticVersionOutput $output
-    if ([string]::IsNullOrWhiteSpace($version) -or (-not $version.Contains("-"))) {
-        throw "DeepSeek Harness is present, but 'dsh --version' did not return its preview semantic version."
+    if ($output -notmatch '(?m)^\s*(?:dsh\s+)?v?(?<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)\s*$') {
+        throw "DeepSeek Harness is present, but 'dsh --version' did not return a semantic version."
     }
-    return $version
+    return $Matches['version']
+}
+
+function Test-DshVersion {
+    param([string] $Version)
+
+    $versionParts = ($Version -replace '\+.*$', '') -split '-', 2
+    $minimumParts = $DshMinimumVersion -split '-', 2
+    if ($versionParts[0] -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+        return $false
+    }
+    $preview = @()
+    if ($versionParts.Count -gt 1) {
+        $preview = @($versionParts[1] -split '\.')
+        foreach ($part in $preview) {
+            if ($part -notmatch '^[0-9A-Za-z-]+$' -or $part -match '^0[0-9]+$') { return $false }
+        }
+    }
+    $release = [version] $versionParts[0]
+    $minimum = [version] $minimumParts[0]
+    if ($release -ne $minimum) { return $release -gt $minimum }
+    if ($preview.Count -eq 0) { return $true }
+    $floor = @($minimumParts[1] -split '\.')
+    for ($index = 0; $index -lt [Math]::Min($preview.Count, $floor.Count); $index++) {
+        $part = $preview[$index]
+        $base = $floor[$index]
+        if ($part -ceq $base) { continue }
+        $numeric = $part -match '^[0-9]+$'
+        $baseNumeric = $base -match '^[0-9]+$'
+        if ($numeric -and $baseNumeric) {
+            if ($part.Length -ne $base.Length) { return $part.Length -gt $base.Length }
+        }
+        elseif ($numeric -ne $baseNumeric) { return $baseNumeric }
+        return [string]::CompareOrdinal($part, $base) -gt 0
+    }
+    return $preview.Count -ge $floor.Count
 }
 
 function Get-DshNodeVersion {
@@ -984,8 +1222,8 @@ function Confirm-DshApplication {
         throw "DeepSeek Harness was installed, but 'dsh' is not available on PATH."
     }
     $version = Get-DshVersion $command.Source
-    if ($version -ne $DshVersion) {
-        throw "DeepSeek Harness $DshVersion is required; found $version after installation."
+    if (-not (Test-DshVersion $version)) {
+        throw "DeepSeek Harness requires >=$DshMinimumVersion; found $version after installation."
     }
     Write-Host "Verified DeepSeek Harness $version."
 }
@@ -1002,7 +1240,7 @@ function Ensure-Dsh {
     if ($DryRun) {
         if (Get-ApplicationCommand "dsh") {
             Write-Host "+ dsh --version"
-            Write-Host "The exact supported DeepSeek Harness preview will be preserved; another version will be replaced."
+            Write-Host "DeepSeek Harness >=$DshMinimumVersion will be preserved; an older version will be upgraded to latest."
         }
         else {
             $node = Get-ApplicationCommand "node"
@@ -1021,11 +1259,11 @@ function Ensure-Dsh {
     $command = Get-ApplicationCommand "dsh"
     if ($command) {
         $version = Get-DshVersion $command.Source
-        if ($version -eq $DshVersion) {
-            Write-Host "DeepSeek Harness $version already matches the supported preview; leaving it unchanged."
+        if (Test-DshVersion $version) {
+            Write-Host "DeepSeek Harness $version already satisfies >=$DshMinimumVersion; leaving it unchanged."
             return
         }
-        Write-Host "DeepSeek Harness $version does not match $DshVersion; replacing it with the supported preview."
+        Write-Host "DeepSeek Harness requires >=$DshMinimumVersion; upgrading $version to latest."
     }
 
     Install-Dsh
@@ -1190,24 +1428,10 @@ function Ensure-Uv {
 }
 
 function Get-PackageSpec {
-    $includeNim = $VoiceNim
-    $includeLocal = $VoiceLocal
-
-    if ($VoiceAll) {
-        $includeNim = $true
-        $includeLocal = $true
+    if ($VoiceLocal) {
+        return "free-claude-code[voice_local]"
     }
-
-    if ($includeNim -and $includeLocal) {
-        return "free-claude-code[voice,voice_local] @ $RepoArchiveUrl"
-    }
-    if ($includeNim) {
-        return "free-claude-code[voice] @ $RepoArchiveUrl"
-    }
-    if ($includeLocal) {
-        return "free-claude-code[voice_local] @ $RepoArchiveUrl"
-    }
-    return "free-claude-code @ $RepoArchiveUrl"
+    return "free-claude-code"
 }
 
 function Install-FreeClaudeCode {
@@ -1299,7 +1523,7 @@ function Configure-AndConfirmFreeClaudeCode {
         [IO.Path]::AltDirectorySeparatorChar
     )
     $installedCommands = @{}
-    foreach ($commandName in @("fcc-desktop", "fcc-server", "fcc-claude", "fcc-codex", "fcc-pi", "fcc-opencode", "fcc-cline", "fcc-hermes", "fcc-dsh", "fcc-grok", "fcc-muse", "fcc-aider")) {
+    foreach ($commandName in @("fcc-desktop", "fcc-server", "fcc-claude", "fcc-codex", "fcc-pi", "fcc-opencode", "fcc-cline", "fcc-hermes", "fcc-dsh", "fcc-grok", "fcc-muse", "fcc-aider", "fcc-doctor", "fcc-update.cmd")) {
         $command = Get-ApplicationCommand $commandName
         if (-not $command) {
             throw "Free Claude Code installation did not create '$commandName'."
@@ -1397,10 +1621,12 @@ if ($RemainingArgs.Count -gt 0) {
     throw "Unknown option: $($RemainingArgs -join ' ')"
 }
 
-if ((-not [string]::IsNullOrWhiteSpace($TorchBackend)) -and (-not ($VoiceLocal -or $VoiceAll))) {
-    throw "-TorchBackend requires -VoiceLocal or -VoiceAll."
+if ((-not [string]::IsNullOrWhiteSpace($TorchBackend)) -and (-not $VoiceLocal)) {
+    throw "-TorchBackend requires -VoiceLocal."
 }
 
+# Preserve the user's winning command before adding installer search paths.
+$script:OriginalOpenCode = Get-ApplicationCommand "opencode"
 Add-KnownBinDirectories
 $script:InstallCline = [bool] ((Get-ApplicationCommand "cline") -or (Get-ApplicationCommand "npm"))
 Write-Step "Checking for running Free Claude Code processes"
@@ -1468,7 +1694,7 @@ else {
         Write-Host "Run DeepSeek Harness with: fcc-dsh"
     }
     else {
-        Write-Host "The fcc-dsh wrapper is ready after you install DeepSeek Harness $DshVersion."
+        Write-Host "The fcc-dsh wrapper is ready after you install DeepSeek Harness >=$DshMinimumVersion."
     }
     if ($script:InstallGrok) {
         Write-Host "Run Grok Build with: fcc-grok"

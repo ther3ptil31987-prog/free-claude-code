@@ -6,12 +6,10 @@ import sys
 from pathlib import Path
 from typing import cast
 
-import json5
-
 from free_claude_code.config.server_urls import same_proxy_url
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.harnesses.claude import claude_proxy_values
-from free_claude_code.harnesses.config_file import atomic_write_text
+from free_claude_code.harnesses.config_file import atomic_write_text, decode_json
 
 _ENV = "claudeCode.environmentVariables"
 _LOGIN = "claudeCode.disableLoginPrompt"
@@ -41,11 +39,9 @@ def _read_object(path: Path) -> JsonObject:
         source = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {}
-    document = json5.loads(source, allow_duplicate_keys=False)
+    document = decode_json(source)
     if not isinstance(document, dict):
         raise ValueError("Settings must be an object")
-    # Also reject non-finite JSON5 numbers before any operation or status result.
-    json.dumps(document, allow_nan=False)
     return cast(JsonObject, document)
 
 
@@ -83,6 +79,47 @@ def _connected(
     )
 
 
+def _connect(
+    path: Path,
+    state_path: Path,
+    document: JsonObject,
+    entries: list[JsonObject],
+    values: dict[str, str],
+) -> bool:
+    onboarding = _read_object(state_path)
+    before = json.dumps(document, allow_nan=False)
+    document[_LOGIN] = True
+    remaining = dict(values)
+    for entry in entries:
+        name = cast(str, entry["name"])
+        if name in remaining:
+            entry["value"] = remaining.pop(name)
+    entries.extend({"name": name, "value": value} for name, value in remaining.items())
+    document[_ENV] = entries
+    settings_changed = json.dumps(document, allow_nan=False) != before
+    onboarding_changed = onboarding.get(_ONBOARDING) is not True
+    if onboarding_changed:
+        onboarding[_ONBOARDING] = True
+        atomic_write_text(
+            state_path, json.dumps(onboarding, indent=2, allow_nan=False) + "\n"
+        )
+    if settings_changed:
+        atomic_write_text(path, json.dumps(document, indent=2, allow_nan=False) + "\n")
+    return settings_changed or onboarding_changed
+
+
+def refresh_connected(
+    path: Path, state_path: Path, proxy_root_url: str, auth_token: str
+) -> bool:
+    """Apply current settings only to an existing connection, even from release one."""
+    path = path.resolve()
+    values = claude_proxy_values(proxy_root_url, auth_token)
+    document, entries = _read(path, set(values))
+    if not _connected(document, entries, values):
+        return False
+    return _connect(path, state_path.resolve(), document, entries, values)
+
+
 def configure(
     path: Path,
     state_path: Path,
@@ -94,43 +131,26 @@ def configure(
     path = path.resolve()
     values = claude_proxy_values(proxy_root_url, auth_token)
     document, entries = _read(path, set(values))
-    onboarding: JsonObject = {}
     if connected is not False:
         state_path = state_path.resolve()
-        onboarding = _read_object(state_path)
-    if connected is not None:
+    if connected is True:
+        _connect(path, state_path, document, entries, values)
+    elif connected is False:
         before = json.dumps(document, allow_nan=False)
-        if connected:
-            document[_LOGIN] = True
-            remaining = dict(values)
-            for entry in entries:
-                name = cast(str, entry["name"])
-                if name in remaining:
-                    entry["value"] = remaining.pop(name)
-            entries.extend(
-                {"name": name, "value": value} for name, value in remaining.items()
-            )
-            document[_ENV] = entries
-        else:
-            document.pop(_LOGIN, None)
-            retained = [entry for entry in entries if entry["name"] not in values]
-            if len(retained) != len(entries):
-                if retained:
-                    document[_ENV] = retained
-                else:
-                    document.pop(_ENV, None)
-        settings_changed = json.dumps(document, allow_nan=False) != before
-        settings_content = json.dumps(document, indent=2, allow_nan=False) + "\n"
-        if connected and onboarding.get(_ONBOARDING) is not True:
-            onboarding[_ONBOARDING] = True
+        document.pop(_LOGIN, None)
+        retained = [entry for entry in entries if entry["name"] not in values]
+        if len(retained) != len(entries):
+            if retained:
+                document[_ENV] = retained
+            else:
+                document.pop(_ENV, None)
+        if json.dumps(document, allow_nan=False) != before:
             atomic_write_text(
-                state_path, json.dumps(onboarding, indent=2, allow_nan=False) + "\n"
+                path, json.dumps(document, indent=2, allow_nan=False) + "\n"
             )
-        if settings_changed:
-            atomic_write_text(path, settings_content)
+    if connected is not None:
         document, entries = _read(path, set(values))
-        if connected:
-            onboarding = _read_object(state_path)
+    onboarding = _read_object(state_path) if connected is not False else {}
     result: JsonObject = {
         "connected": _connected(document, entries, values)
         and onboarding.get(_ONBOARDING) is True,

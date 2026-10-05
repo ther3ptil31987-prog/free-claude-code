@@ -18,6 +18,13 @@ class ProviderFieldOverride(TypedDict, total=False):
 
 
 _PROVIDER_FIELD_OVERRIDES: dict[str, ProviderFieldOverride] = {
+    "ANTHROPIC_API_KEY": {
+        "description": "Anthropic API access with separate usage billing. Messages requests use Anthropic tools and client thinking controls. Native fallback uses other Anthropic models. FCC local web and prompt optimizations apply to compatibility routes.",
+    },
+    "OPENAI_API_KEY": {
+        "label": "OpenAI API Key",
+        "description": "API key for the OpenAI Platform. Separate from ChatGPT sign-in.",
+    },
     "OPENAI_PROXY": {
         "description": (
             "Optional proxy used for OpenAI sign-in and ChatGPT Codex requests. "
@@ -161,6 +168,19 @@ _PROVIDER_FIELD_OVERRIDES: dict[str, ProviderFieldOverride] = {
             "models."
         ),
     },
+    "ALIBABA_CLOUD_API_KEY": {
+        "description": (
+            "Alibaba Cloud Model Studio pay-as-you-go API key. Use a key from "
+            "the same region as the base URL."
+        ),
+    },
+    "ALIBABA_CLOUD_BASE_URL": {
+        "description": (
+            "Optional Model Studio OpenAI-compatible base URL ending in "
+            "/compatible-mode/v1. Defaults to Singapore. Set your regional "
+            "or workspace URL when using a key from another region."
+        ),
+    },
     "QWENCLOUD_API_KEY": {
         "label": "QwenCloud Token Plan API Key",
         "description": (
@@ -202,6 +222,13 @@ _PROVIDER_FIELD_OVERRIDES: dict[str, ProviderFieldOverride] = {
         "description": (
             "Nebius Token Factory API key for OpenAI-compatible chat, reasoning, "
             "and tool-capable models."
+        ),
+    },
+    "OPPER_API_KEY": {
+        "label": "Opper API Key",
+        "description": (
+            "Opper gateway key for OpenAI-compatible chat, reasoning and "
+            "tool-capable models across its EU-hosted model pools."
         ),
     },
     "SCW_SECRET_KEY": {
@@ -251,23 +278,11 @@ _PROVIDER_FIELD_OVERRIDES: dict[str, ProviderFieldOverride] = {
             "TokenRouter OpenAI-compatible gateway API key for api.tokenrouter.com/v1."
         ),
     },
-    "TOKENROUTER_BASE_URL": {
-        "description": (
-            "TokenRouter OpenAI-compatible Chat Completions base URL. "
-            "Defaults to https://api.tokenrouter.com/v1."
-        ),
-    },
     "NARAROUTE_API_KEY": {
         "label": "NaraRoute API Key",
         "description": (
             "NaraRoute OpenAI-compatible gateway API key for router.bynara.id/v1. "
             "Keys begin with sk-nry-; create one at router.bynara.id/keys."
-        ),
-    },
-    "NARAROUTE_BASE_URL": {
-        "description": (
-            "NaraRoute OpenAI-compatible Chat Completions base URL. "
-            "Defaults to https://router.bynara.id/v1."
         ),
     },
     "LIGHTNING_API_KEY": {
@@ -277,10 +292,19 @@ _PROVIDER_FIELD_OVERRIDES: dict[str, ProviderFieldOverride] = {
             "lightning.ai/api/v1. Create one on lightning.ai under Model APIs."
         ),
     },
-    "LIGHTNING_BASE_URL": {
+    "ORCAROUTER_API_KEY": {
+        "label": "OrcaRouter API Key",
         "description": (
-            "Lightning AI OpenAI-compatible Chat Completions base URL. "
-            "Defaults to https://lightning.ai/api/v1."
+            "OrcaRouter OpenAI-compatible multi-provider gateway API key for "
+            "api.orcarouter.ai/v1. Keys begin with sk-orca-; create one at "
+            "www.orcarouter.ai/console."
+        ),
+    },
+    "XKIRO_API_KEY": {
+        "label": "xKiro API Key",
+        "description": (
+            "xKiro API key for api.xkiro.com/v1. "
+            "Create one at xkiro.com/dashboard/api/keys."
         ),
     },
     "AGNES_API_KEY": {
@@ -311,10 +335,12 @@ _PROVIDER_FIELD_OVERRIDES: dict[str, ProviderFieldOverride] = {
             "hex characters; mint one at platform.experientiallabs.ai/settings/api-keys."
         ),
     },
-    "EXPLABS_BASE_URL": {
+    "CHEAPER_INFERENCE_API_KEY": {
+        "label": "Cheaper Inference API Key",
         "description": (
-            "Experiential Labs OpenAI-compatible Chat Completions base URL. "
-            "Defaults to https://api.experientiallabs.ai/v1."
+            "Cheaper Inference OpenAI-compatible gateway API key for "
+            "api.cheaperinference.com/v1. "
+            "Keys start with ci_live_; create one at cheaperinference.com/signup."
         ),
     },
 }
@@ -325,6 +351,14 @@ def provider_field_specs() -> tuple[ConfigFieldSpec, ...]:
 
     return (
         *_credential_field_specs(),
+        ConfigFieldSpec(
+            key="ANTHROPIC_WORKSPACE_ID",
+            label="Anthropic Workspace ID",
+            section_id="providers",
+            settings_attr="anthropic_workspace_id",
+            provider_ids=("anthropic",),
+            description="Optional for workspace-scoped keys. Required for multi-workspace API keys.",
+        ),
         *_cloudflare_account_field_specs(),
         *_vertex_field_specs(),
         *_base_url_field_specs(),

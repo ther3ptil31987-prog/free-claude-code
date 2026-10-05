@@ -68,6 +68,7 @@ _MODELS = _list_field("data")
 # https://ai.google.dev/gemini-api/docs/generate-content/api-errors
 # https://github.com/nebius/nebius-physical-ai/blob/main/docs/workbench/token-factory.md
 # https://www.scaleway.com/en/docs/generative-apis/
+# https://docs.opper.ai/build/chat/drop-in-sdks
 # https://vercel.com/docs/ai-gateway/sdks-and-apis/rest-api
 # https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/hf_api.py
 # https://docs.cohere.com/reference/list-models
@@ -76,6 +77,8 @@ _MODELS = _list_field("data")
 # https://router.bynara.id/id/docs
 # https://platform.experientiallabs.ai/docs/authentication
 _PROBES = (
+    # https://platform.claude.com/docs/en/api/models/list
+    _Probe("anthropic", "/models?limit=1", _MODELS, _AUTH_401),
     _Probe(
         "open_router",
         "/key",
@@ -111,6 +114,7 @@ _PROBES = (
     ),
     _Probe("nebius", "/models", _MODELS, _AUTH_401),
     _Probe("scaleway", "/models", _MODELS, _AUTH_401),
+    _Probe("opper", "/models", _MODELS, _AUTH_401),
     _Probe(
         "vercel",
         "/credits",
@@ -145,6 +149,19 @@ _PROBES = (
     ),
     _Probe("nararoute", "/models", _MODELS, _AUTH_401),
     _Probe("experiential", "/models", _MODELS, _AUTH_401),
+    _Probe("orcarouter", "/models", _MODELS, _AUTH_401),
+    # xKiro's /models is public; /usage requires the inference API key.
+    # https://docs.xkiro.com/api/usage/
+    _Probe(
+        "xkiro",
+        "/usage",
+        lambda p: (
+            _field(p, "object") == "usage"
+            and isinstance(_field(p, "windows"), list)
+            and isinstance(_field(p, "free_tokens"), Mapping)
+        ),
+        _AUTH_401,
+    ),
     # Positive evidence only: these errors can also reflect permissions, budget,
     # token type, or an undocumented response contract. Never reject on failure.
     # https://docs.deepinfra.com/api-reference/account/me
@@ -156,6 +173,7 @@ _PROBES = (
     # https://inference-docs.cerebras.ai/api-reference/models/list-models
     # https://docs.sambanova.ai/docs/api-reference/models/get-environments-available-model-list-metadata
     # https://docs.fireworks.ai/api-reference/list-accounts
+    # https://cheaperinference.com/docs
     _Probe("deepinfra", "https://api.deepinfra.com/v1/me", _identity("uid")),
     _Probe("mistral", "/models", _MODELS),
     _Probe("wandb", "/models", _MODELS),
@@ -167,6 +185,7 @@ _PROBES = (
     ),
     _Probe("cerebras", "/models", _MODELS),
     _Probe("sambanova", "/models", _MODELS),
+    _Probe("cheaperinference", "/models", _MODELS),
     _Probe(
         "fireworks",
         "https://api.fireworks.ai/v1/accounts?pageSize=1",
@@ -229,6 +248,11 @@ def _interpret(key: str, probe: _Probe, response: httpx.Response) -> CredentialC
             CredentialStatus.REJECTED,
             "The provider rejected this API key. Check it or create a new key.",
         )
+    if probe.provider_id == "anthropic":
+        return _unverified(
+            key,
+            "Could not verify this key. Check the Workspace ID, API permissions, billing, or rate limits. You can still save it.",
+        )
     if response.status_code in {402, 403}:
         return _unverified(
             key,
@@ -263,6 +287,10 @@ async def _check_one(settings: Settings, key: str, probe: _Probe) -> CredentialC
         headers["x-goog-api-key"] = credential
     else:
         headers["Authorization"] = f"Bearer {credential}"
+    if probe.provider_id == "anthropic":
+        from free_claude_code.providers.anthropic.headers import api_headers
+
+        headers.update(api_headers(credential, settings.anthropic_workspace_id))
     if probe.provider_id == "novita":
         headers["Content-Type"] = "application/json"
     try:

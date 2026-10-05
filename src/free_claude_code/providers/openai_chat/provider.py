@@ -16,6 +16,7 @@ from free_claude_code.core.reasoning import (
     DEFAULT_REASONING_POLICY,
     ReasoningPolicy,
 )
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
     ProviderOperationKind,
@@ -103,6 +104,7 @@ class OpenAIChatProvider(BaseProvider):
             required_null_field=listing.required_null_field,
             required_sequence_items=listing.required_sequence_items,
             exclude_missing_sequence_fields=listing.exclude_missing_sequence_fields,
+            optional_sequence_items=listing.optional_sequence_items,
             tags_field=listing.tags_field,
             thinking_tag=listing.thinking_tag,
             non_thinking_tag=listing.non_thinking_tag,
@@ -212,6 +214,7 @@ class OpenAIChatProvider(BaseProvider):
         model_info: ProviderModelInfo | None = None,
         endpoint_context: EndpointContext | None = None,
         request_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         return self._chat.stream_messages(
             request,
@@ -221,6 +224,7 @@ class OpenAIChatProvider(BaseProvider):
             reasoning=reasoning,
             endpoint_context=endpoint_context,
             model_info=model_info,
+            continuation=continuation,
         )
 
     def stream_responses(
@@ -233,6 +237,8 @@ class OpenAIChatProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         endpoint_context: EndpointContext | None = None,
         request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         return self._chat.stream_responses(
             request,
@@ -241,4 +247,5 @@ class OpenAIChatProvider(BaseProvider):
             response_model=response_model,
             reasoning=reasoning,
             endpoint_context=endpoint_context,
+            continuation=continuation,
         )

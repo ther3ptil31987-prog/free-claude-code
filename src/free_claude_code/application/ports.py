@@ -6,15 +6,27 @@ from typing import Protocol
 
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import MessagesRequest
+from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.stream_recovery import ContinuationSeed
 
 from .model_metadata import ProviderModelInfo
 
 
 class ProviderPort(Protocol):
     """Minimal provider capability required to execute one request."""
+
+    def stream_native_messages(
+        self,
+        request: NativeMessagesRequest,
+        *,
+        request_id: str,
+        response_model: str,
+        request_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[str]: ...
 
     def stream_messages(
         self,
@@ -26,6 +38,7 @@ class ProviderPort(Protocol):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]: ...
 
     def stream_responses(
@@ -37,6 +50,8 @@ class ProviderPort(Protocol):
         response_model: str,
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]: ...
 
 

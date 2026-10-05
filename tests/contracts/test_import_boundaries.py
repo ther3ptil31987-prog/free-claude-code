@@ -11,6 +11,7 @@ _PACKAGE_ROOT = _REPO_ROOT / "src" / "free_claude_code"
 _PACKAGE_NAME = "free_claude_code"
 
 ALLOWED_PACKAGE_DEPENDENCIES: dict[str, set[str]] = {
+    "updater": set(),
     "config": {"core"},
     "core": set(),
     "application": {"config", "core"},
@@ -33,6 +34,13 @@ ALLOWED_PACKAGE_DEPENDENCIES: dict[str, set[str]] = {
 
 IMPORT_EXCEPTIONS: dict[tuple[str, str], str] = {
     (
+        "free_claude_code.cli.doctor",
+        "free_claude_code.runtime.diagnostics",
+    ): (
+        "Owner: installed diagnostic command. "
+        "Reason: read-only report composition owns provider and harness inspection."
+    ),
+    (
         "free_claude_code.cli.commands",
         "free_claude_code.runtime.bootstrap",
     ): (
@@ -47,7 +55,7 @@ FACADE_ONLY_BOUNDARIES = {
     "free_claude_code.providers.openai_chat",
 }
 
-OPTIONAL_IMPORT_OWNERS = {
+DEFERRED_IMPORT_OWNERS = {
     "librosa": "free_claude_code.messaging.transcription",
     "torch": "free_claude_code.messaging.transcription",
     "transformers": "free_claude_code.messaging.transcription",
@@ -207,6 +215,8 @@ def test_native_model_catalog_has_no_http_formatter_or_decoder_dependency() -> N
         f"{_PACKAGE_NAME}.runtime.codex_app_server",
         f"{_PACKAGE_NAME}.runtime.codex_catalog",
         f"{_PACKAGE_NAME}.harnesses.codex_model_catalog",
+        f"{_PACKAGE_NAME}.harnesses.vscode_chat_integration",
+        f"{_PACKAGE_NAME}.harnesses.model_policy",
     }
     offenders = [
         record.describe()
@@ -657,24 +667,24 @@ def test_providers_do_not_own_wire_error_type_literals() -> None:
     assert sorted(offenders) == []
 
 
-def test_optional_dependencies_have_one_lazy_owner() -> None:
+def test_transcription_dependencies_have_one_lazy_owner() -> None:
     seen: set[str] = set()
     offenders: list[str] = []
     for record in _scan_imports(_PACKAGE_ROOT):
         dependency = record.imported.split(".", 1)[0]
-        owner = OPTIONAL_IMPORT_OWNERS.get(dependency)
+        owner = DEFERRED_IMPORT_OWNERS.get(dependency)
         if owner is None:
             continue
         seen.add(dependency)
         if record.importer != owner or not record.inside_function:
             offenders.append(record.describe())
 
-    assert seen == set(OPTIONAL_IMPORT_OWNERS)
+    assert seen == set(DEFERRED_IMPORT_OWNERS)
     assert sorted(offenders) == []
 
 
-def test_runtime_imports_without_optional_voice_dependencies() -> None:
-    blocked = sorted(OPTIONAL_IMPORT_OWNERS)
+def test_runtime_imports_without_loading_transcription_dependencies() -> None:
+    blocked = sorted(DEFERRED_IMPORT_OWNERS)
     script = "\n".join(
         (
             "import importlib.abc",

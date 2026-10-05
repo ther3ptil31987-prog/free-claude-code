@@ -11,18 +11,23 @@ from typing import Literal
 from loguru import logger
 
 from free_claude_code.core.anthropic import (
-    Message,
-    SystemContent,
-    Tool,
     anthropic_request_snapshot,
     get_token_count,
 )
+from free_claude_code.core.anthropic.tokens import TokenCounter
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.openai_responses import (
     OpenAIResponsesRequest,
     estimate_responses_input_tokens,
 )
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.request_outcomes import record_request_route
+from free_claude_code.core.stream_delivery import current_stream_delivery
+from free_claude_code.core.stream_recovery import (
+    ContinuationSeed,
+    RecoveryAction,
+    assess_recovery,
+)
 from free_claude_code.core.trace import (
     close_stream_input,
     trace_event,
@@ -34,17 +39,14 @@ from .routing import (
     ProviderModelTarget,
     ResolvedModelRoute,
     RoutedMessagesRequest,
+    RoutedNativeMessagesRequest,
     RoutedResponsesRequest,
 )
 
-TokenCounter = Callable[
-    [list[Message], str | list[SystemContent] | None, list[Tool] | None],
-    int,
-]
 ResponsesTokenCounter = Callable[[OpenAIResponsesRequest], int]
 WireApi = Literal["messages", "responses"]
 CandidateStreamOpener = Callable[
-    [int, ProviderModelTarget], Awaitable[AsyncIterator[str]]
+    [int, ProviderModelTarget, ContinuationSeed | None], Awaitable[AsyncIterator[str]]
 ]
 
 
@@ -109,6 +111,8 @@ class ProviderExecutor:
         failure: ExecutionFailure,
         candidate_index: int,
         candidate_count: int,
+        recovery_action: str,
+        recovery_reason: str | None,
     ) -> None:
         fields: dict[str, object] = {
             "stage": "execution",
@@ -123,6 +127,8 @@ class ProviderExecutor:
             "failure_kind": failure.kind.value,
             "status_code": failure.status_code,
             "provider_retryable": failure.retryable,
+            "recovery_action": recovery_action,
+            "recovery_reason": recovery_reason,
         }
         if self._generation_id is not None:
             fields["generation_id"] = self._generation_id
@@ -162,11 +168,50 @@ class ProviderExecutor:
             fields["generation_id"] = self._generation_id
         trace_event(**fields)
 
+    def stream_native_messages(
+        self,
+        routed: RoutedNativeMessagesRequest,
+        *,
+        request_id: str,
+    ) -> AsyncIterator[str]:
+        async def open_candidate(
+            index: int,
+            target: ProviderModelTarget,
+            continuation: ContinuationSeed | None,
+        ) -> AsyncIterator[str]:
+            provider = await self._provider_resolver(target.provider_id)
+            return provider.stream_native_messages(
+                routed.request.with_model(target.provider_model),
+                request_id=request_id,
+                response_model=routed.resolved.original_model,
+                request_headers=self._request_headers,
+                continuation=continuation,
+            )
+
+        messages = routed.request.body["messages"]
+        assert isinstance(messages, list)
+        return self._stream_candidates(
+            resolved=routed.resolved,
+            reasoning=ReasoningPolicy.provider_default(),
+            wire_api="messages",
+            raw_log_label="FULL_NATIVE_MESSAGES_PAYLOAD",
+            raw_log_payload=lambda: routed.request.body,
+            request_snapshot=lambda: {
+                "model": routed.request.model,
+                "message_count": len(messages),
+                "contract": "native",
+            },
+            ingress_count_name="message_count",
+            ingress_count=len(messages),
+            request_id=request_id,
+            open_candidate=open_candidate,
+        )
+
     def stream_messages(
         self,
         routed: RoutedMessagesRequest,
         *,
-        raw_log_payload: object,
+        raw_log_payload: Callable[[], object],
         request_id: str,
     ) -> AsyncIterator[str]:
         """Execute one Anthropic Messages request."""
@@ -181,6 +226,7 @@ class ProviderExecutor:
         async def open_candidate(
             index: int,
             target: ProviderModelTarget,
+            continuation: ContinuationSeed | None,
         ) -> AsyncIterator[str]:
             provider = await self._provider_resolver(target.provider_id)
             request = (
@@ -201,6 +247,7 @@ class ProviderExecutor:
                     target.provider_id, target.provider_model
                 ),
                 request_headers=self._request_headers,
+                continuation=continuation,
             )
 
         return self._stream_candidates(
@@ -209,7 +256,7 @@ class ProviderExecutor:
             wire_api="messages",
             raw_log_label="FULL_PAYLOAD",
             raw_log_payload=raw_log_payload,
-            request_snapshot=anthropic_request_snapshot(routed.request),
+            request_snapshot=lambda: anthropic_request_snapshot(routed.request),
             ingress_count_name="message_count",
             ingress_count=len(routed.request.messages),
             request_id=request_id,
@@ -220,7 +267,7 @@ class ProviderExecutor:
         self,
         routed: RoutedResponsesRequest,
         *,
-        raw_log_payload: object,
+        raw_log_payload: Callable[[], object],
         request_id: str,
     ) -> AsyncIterator[str]:
         """Execute one native OpenAI Responses request."""
@@ -231,6 +278,7 @@ class ProviderExecutor:
         async def open_candidate(
             index: int,
             target: ProviderModelTarget,
+            continuation: ContinuationSeed | None,
         ) -> AsyncIterator[str]:
             provider = await self._provider_resolver(target.provider_id)
             request = (
@@ -248,6 +296,10 @@ class ProviderExecutor:
                 response_model=routed.resolved.original_model,
                 reasoning=routed.reasoning,
                 request_headers=self._request_headers,
+                continuation=continuation,
+                model_info=self._model_info_lookup(
+                    target.provider_id, target.provider_model
+                ),
             )
 
         raw_input = routed.request.input
@@ -262,7 +314,7 @@ class ProviderExecutor:
             wire_api="responses",
             raw_log_label="FULL_RESPONSES_PAYLOAD",
             raw_log_payload=raw_log_payload,
-            request_snapshot={
+            request_snapshot=lambda: {
                 "model": routed.request.model,
                 "input_item_count": input_item_count,
                 "tool_count": len(routed.request.tools or ()),
@@ -280,8 +332,8 @@ class ProviderExecutor:
         reasoning: ReasoningPolicy,
         wire_api: WireApi,
         raw_log_label: str,
-        raw_log_payload: object,
-        request_snapshot: dict[str, object],
+        raw_log_payload: Callable[[], object],
+        request_snapshot: Callable[[], dict[str, object]],
         ingress_count_name: str,
         ingress_count: int,
         request_id: str,
@@ -314,7 +366,6 @@ class ProviderExecutor:
             route_trace["generation_id"] = self._generation_id
         trace_event(**route_trace)
 
-        request_snapshot["model"] = gateway_model
         ingress_trace: dict[str, object] = {
             "stage": "ingress",
             "event": (
@@ -323,28 +374,35 @@ class ProviderExecutor:
                 else "free_claude_code.api.request.received"
             ),
             "source": "api",
-            "snapshot": request_snapshot,
             "request_id": request_id,
             ingress_count_name: ingress_count,
         }
         trace_event(
+            lambda: {"snapshot": {**request_snapshot(), "model": gateway_model}},
             **ingress_trace,
         )
 
         if self._log_raw_payloads:
-            logger.debug(f"{raw_log_label} [{{}}]: {{}}", request_id, raw_log_payload)
+            logger.opt(lazy=True).debug(
+                f"{raw_log_label} [{{}}]: {{}}", lambda: request_id, raw_log_payload
+            )
 
         async def provider_body() -> AsyncIterator[str]:
             loop = asyncio.get_running_loop()
             progress_deadline = loop.time() + self._progress_timeout_seconds
+            delivery = current_stream_delivery()
+            continuation: ContinuationSeed | None = None
             for index, target in enumerate(candidates):
+                record_request_route(target.provider_id, target.provider_model)
                 provider_stream: AsyncIterator[str] | None = None
                 candidate_committed = False
                 candidate_failure: ExecutionFailure | None = None
                 try:
                     opening_started = monotonic()
                     try:
-                        provider_stream = await open_candidate(index, target)
+                        provider_stream = await open_candidate(
+                            index, target, continuation
+                        )
                     except ExecutionFailure as failure:
                         candidate_failure = failure
                     finally:
@@ -427,8 +485,31 @@ class ProviderExecutor:
 
                 if candidate_failure is None:
                     return
-                if candidate_committed or index + 1 >= len(candidates):
+                recovery_action = "continue" if continuation is not None else "restart"
+                recovery_reason = "no_candidate_output"
+                context = candidate_failure.stream_context
+                if delivery is None or context is None:
+                    if candidate_committed:
+                        raise candidate_failure
+                else:
+                    assessment = assess_recovery(
+                        content_released=delivery.content_released,
+                        prefix=delivery.prefix,
+                        source=context.source,
+                        retryable=candidate_failure.retryable,
+                    )
+                    if assessment.action is RecoveryAction.STOP:
+                        raise candidate_failure
+                    if assessment.action is RecoveryAction.HANDOFF:
+                        delivery.begin_continuation(handoff=True)
+                        return
+                    continuation = assessment.seed
+                    recovery_action = assessment.action.value
+                    recovery_reason = assessment.reason
+                if index + 1 >= len(candidates):
                     raise candidate_failure
+                if delivery is not None and continuation is not None:
+                    delivery.begin_continuation()
                 next_target = candidates[index + 1]
                 self._trace_fallback_started(
                     request_id=request_id,
@@ -438,6 +519,8 @@ class ProviderExecutor:
                     failure=candidate_failure,
                     candidate_index=index + 2,
                     candidate_count=len(candidates),
+                    recovery_action=recovery_action,
+                    recovery_reason=recovery_reason,
                 )
 
         stream_trace: dict[str, object] = {

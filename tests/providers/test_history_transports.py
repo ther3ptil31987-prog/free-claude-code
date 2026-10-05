@@ -15,7 +15,11 @@ from free_claude_code.core.anthropic import aggregate_anthropic_sse_to_message
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
-from free_claude_code.core.history_replay import decode_replay, encode_replay
+from free_claude_code.core.history_replay import (
+    decode_replay,
+    encode_replay,
+    resolve_messages_replay,
+)
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.open_router import OpenRouterProvider
@@ -131,7 +135,9 @@ def _events_for(protocol):
 
 
 @asynccontextmanager
-async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=None):
+async def _harness(
+    protocol, responder=None, *, key="a", chat_provider_factory=None, max_attempts=5
+):
     bodies: list[dict[str, Any]] = []
 
     def reply(request):
@@ -142,6 +148,10 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
         module = httpx if protocol == "messages" else httpx2
         if status != 200:
             return module.Response(status, json={"error": payload})
+        if isinstance(payload, module.AsyncByteStream):
+            return module.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=payload
+            )
         raw = "".join(
             (f"event: {event['type']}\n" if protocol == "messages" else "")
             + f"data: {json.dumps(event)}\n\n"
@@ -153,14 +163,16 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
 
     if protocol == "messages":
         client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
-        provider = messages_transport(client, immediate_admission(max_attempts=5))
+        provider = messages_transport(
+            client, immediate_admission(max_attempts=max_attempts)
+        )
         endpoint = Endpoint()
         endpoint.token = key
         extras = {"endpoint_context": endpoint}
     else:
         client = _client(reply, api_key=key)
         if protocol == "responses":
-            provider = responses_transport(client)
+            provider = responses_transport(client, max_attempts=max_attempts)
         else:
             with patch(
                 "free_claude_code.providers.openai_chat.client.AsyncOpenAI",
@@ -173,12 +185,12 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
                         make_provider_config(
                             api_key=key, base_url="https://provider.invalid/v1"
                         ),
-                        admission=immediate_admission(max_attempts=5),
+                        admission=immediate_admission(max_attempts=max_attempts),
                     )
                 )
         extras = {}
 
-    def stream(wire, history):
+    def stream(wire, history, *, tools=None, model="requested", continuation=None):
         options: dict[str, Any] = dict(
             input_tokens=0,
             request_id="history-test",
@@ -189,15 +201,19 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
         if protocol == "messages":
             options.pop("input_tokens")
             options["reasoning"] = ReasoningPolicy.provider_default()
+        if continuation is not None:
+            options["continuation"] = continuation
         if wire == "responses":
             return provider.stream_responses(
                 OpenAIResponsesRequest.model_validate(
-                    {"model": "requested", "input": history}
+                    {"model": model, "input": history, "tools": tools}
                 ),
                 **options,
             )
         return provider.stream_messages(
-            MessagesRequest.model_validate({"model": "requested", "messages": history}),
+            MessagesRequest.model_validate(
+                {"model": model, "messages": history, "tools": tools}
+            ),
             **options,
         )
 
@@ -224,12 +240,14 @@ def _carrier(history, wire):
         return next(
             item["encrypted_content"]
             for item in history
-            if item.get("type") == "reasoning"
+            if item.get("type") == "reasoning" and item.get("encrypted_content")
         )
     return next(
         block.get("signature", block.get("data"))
-        for block in history[0]["content"]
-        if block["type"] in {"thinking", "redacted_thinking"}
+        for block in resolve_messages_replay(history[0]["content"])
+        if isinstance(block, dict)
+        and block["type"] in {"thinking", "redacted_thinking"}
+        and block.get("signature", block.get("data"))
     )
 
 
@@ -454,7 +472,7 @@ async def test_successful_fallback_stamps_its_own_origin_and_gets_unmodified_inp
     try:
         saved = await _saved_reply(
             executor.stream_messages(
-                routed, raw_log_payload={}, request_id="actual-fallback"
+                routed, raw_log_payload=dict, request_id="actual-fallback"
             ),
             "messages",
         )
@@ -516,13 +534,13 @@ def _chat_reasoning_events(deltas):
             "<tool_call>",
             "<function=lookup><parameter=query>x</parameter></function></tool_call>",
             "stop",
-            True,
+            False,
         ),
         (
             "● <function=lookup>",
             "<parameter=query>x</parameter></function>",
             "stop",
-            True,
+            False,
         ),
         ("<", None, "tool_calls", True),
         ("<", "", "length", False),
@@ -745,6 +763,8 @@ async def test_chat_plaintext_beside_encrypted_details_survives_switching(
             if wire == "responses":
                 saved[0]["encrypted_content"] = carrier
             else:
+                # Model an older complete v1 transcript before removing its readable field.
+                saved[0]["content"] = resolve_messages_replay(saved[0]["content"])
                 saved[0]["content"][0]["signature"] = carrier
         else:
             assert record.native["reasoning_content"] == text

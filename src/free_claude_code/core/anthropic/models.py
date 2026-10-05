@@ -111,7 +111,7 @@ class ThinkingConfig(BaseModel):
     enabled: bool | None = True
     type: str | None = None
     budget_tokens: int | None = None
-    display: Literal["summarized", "omitted"] | None = None
+    display: Literal["summarized", "omitted", "updates"] | None = None
 
 
 class MessagesRequest(BaseModel):
@@ -165,6 +165,26 @@ class TokenCountRequest(BaseModel):
 
 class TokenCountResponse(BaseModel):
     input_tokens: int
+
+
+class NativeTokenCountMessage(BaseModel):
+    """The outer message shape needed by local estimation, with opaque blocks."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    role: str
+    content: str | list[dict[str, Any]]
+
+
+class NativeTokenCountRequest(BaseModel):
+    """Count native inputs without applying compatibility protocol validation."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    model: str = Field(min_length=1)
+    messages: list[NativeTokenCountMessage]
+    system: str | list[dict[str, Any]] | None = None
+    tools: list[dict[str, Any]] | None = None
 
 
 class Usage(BaseModel):

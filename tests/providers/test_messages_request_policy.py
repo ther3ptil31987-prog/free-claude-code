@@ -1,5 +1,7 @@
 """Native controls stay metadata-driven and preserve exact caller budgets."""
 
+from typing import Literal
+
 import pytest
 
 from free_claude_code.core.anthropic.models import ThinkingConfig
@@ -68,17 +70,20 @@ def test_adaptive_only_rejects_exact_budget_but_allows_off() -> None:
     assert options.thinking == {"type": "disabled"}
 
 
-def test_explicit_native_mode_works_without_model_heuristics() -> None:
+@pytest.mark.parametrize("display", ["summarized", "omitted", "updates"])
+def test_explicit_native_mode_works_without_model_heuristics(
+    display: Literal["summarized", "omitted", "updates"],
+) -> None:
     options = resolve_messages_options(
         model="unfamiliar-name",
         max_tokens=4096,
         reasoning=ReasoningPolicy.on(budget_tokens=1536),
-        thinking=ThinkingConfig(type="enabled", budget_tokens=1536, display="omitted"),
+        thinking=ThinkingConfig(type="enabled", budget_tokens=1536, display=display),
     )
     assert options.thinking == {
         "type": "enabled",
         "budget_tokens": 1536,
-        "display": "omitted",
+        "display": display,
     }
     options = resolve_messages_options(
         model="another-name",
@@ -131,7 +136,10 @@ def test_manual_effort_uses_budget_and_minimum() -> None:
 
 
 @pytest.mark.parametrize("raw", ["bogus", 1, {"mode": "high"}])
-def test_client_on_cannot_hide_invalid_output_effort(raw: object) -> None:
+@pytest.mark.parametrize("preserve_native_controls", [False, True])
+def test_client_on_cannot_hide_invalid_output_effort(
+    raw: object, preserve_native_controls: bool
+) -> None:
     with pytest.raises(NativeMessagesError, match="client output effort"):
         resolve_messages_options(
             model="m",
@@ -139,6 +147,7 @@ def test_client_on_cannot_hide_invalid_output_effort(raw: object) -> None:
             output_effort=raw,
             reasoning=ReasoningPolicy.on(budget_tokens=1536),
             thinking=ThinkingConfig(type="enabled", budget_tokens=1536),
+            preserve_native_controls=preserve_native_controls,
         )
 
 
