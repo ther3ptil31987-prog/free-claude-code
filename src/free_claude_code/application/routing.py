@@ -12,6 +12,7 @@ from free_claude_code.config.model_refs import (
     is_retired_model_ref,
     parse_model_name,
     parse_provider_type,
+    replace_retired_model_ref,
 )
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.config.reasoning import ReasoningPreference
@@ -22,16 +23,23 @@ from free_claude_code.core.anthropic import (
     TokenCountRequest,
 )
 from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
+from free_claude_code.core.chat_completions.request import ChatRequest
 from free_claude_code.core.gateway_model_ids import (
     DESKTOP_MODEL_PREFIX,
     DESKTOP_NO_THINKING_PREFIX,
     decode_gateway_model_id,
 )
+from free_claude_code.core.gemini import GeminiRequest
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.core.trace import trace_event
 
-from .reasoning import resolve_reasoning_policy, resolve_responses_reasoning_policy
+from .reasoning import (
+    resolve_chat_reasoning_policy,
+    resolve_gemini_reasoning_policy,
+    resolve_reasoning_policy,
+    resolve_responses_reasoning_policy,
+)
 
 _ROUTE_SETTINGS = (
     ("fable", "model_fable", "reasoning_fable"),
@@ -48,6 +56,15 @@ class ProviderModelTarget:
     provider_id: str
     provider_model: str
     provider_model_ref: str
+    api_key_number: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderModelCandidate:
+    """One execution target with a candidate-local reasoning preference."""
+
+    target: ProviderModelTarget
+    reasoning_preference: ReasoningPreference = ReasoningPreference.INHERIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +73,7 @@ class ResolvedModelRoute:
 
     original_model: str
     primary: ProviderModelTarget
-    fallbacks: tuple[ProviderModelTarget, ...]
+    fallbacks: tuple[ProviderModelCandidate, ...]
     reasoning_preference: ReasoningPreference
 
 
@@ -81,6 +98,20 @@ def supports_native_messages(provider_id: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class RoutedResponsesRequest:
     request: OpenAIResponsesRequest
+    resolved: ResolvedModelRoute
+    reasoning: ReasoningPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class RoutedGeminiRequest:
+    request: GeminiRequest
+    resolved: ResolvedModelRoute
+    reasoning: ReasoningPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class RoutedChatRequest:
+    request: ChatRequest
     resolved: ResolvedModelRoute
     reasoning: ReasoningPolicy
 
@@ -140,28 +171,39 @@ class ModelRouter:
             reasoning_preference=reasoning_preference,
         )
 
-    def _target_from_ref(self, provider_model_ref: str) -> ProviderModelTarget:
+    def _target_from_ref(
+        self, provider_model_ref: str, api_key_number: int = 1
+    ) -> ProviderModelTarget:
         return self._target(
             parse_provider_type(provider_model_ref),
             parse_model_name(provider_model_ref),
+            api_key_number,
         )
 
-    def _target(self, provider_id: str, provider_model: str) -> ProviderModelTarget:
+    def _target(
+        self, provider_id: str, provider_model: str, api_key_number: int = 1
+    ) -> ProviderModelTarget:
         self._validate_provider_id(provider_id)
         return ProviderModelTarget(
             provider_id=provider_id,
             provider_model=provider_model,
             provider_model_ref=f"{provider_id}/{provider_model}",
+            api_key_number=api_key_number,
         )
 
     def _fallback_targets(
         self, primary: ProviderModelTarget
-    ) -> tuple[ProviderModelTarget, ...]:
+    ) -> tuple[ProviderModelCandidate, ...]:
         configured = tuple(
-            self._target_from_ref(model_ref)
-            for model_ref in self._settings.model_fallbacks or ()
+            ProviderModelCandidate(
+                self._target_from_ref(entry.model, entry.api_key_number),
+                entry.reasoning,
+            )
+            for entry in self._settings.model_fallbacks or ()
         )
-        return tuple(target for target in configured if target != primary)
+        return tuple(
+            candidate for candidate in configured if candidate.target != primary
+        )
 
     def _validate_provider_id(self, provider_id: str) -> None:
         if provider_id not in self._settings.provider_ids:
@@ -185,6 +227,13 @@ class ModelRouter:
             return (
                 parse_provider_type(self._settings.model),
                 parse_model_name(self._settings.model),
+                decoded.force_reasoning_off if decoded is not None else False,
+            )
+        replacement = replace_retired_model_ref(candidate)
+        if replacement != candidate:
+            return (
+                parse_provider_type(replacement),
+                parse_model_name(replacement),
                 decoded.force_reasoning_off if decoded is not None else False,
             )
         if decoded is not None:
@@ -254,9 +303,9 @@ class ModelRouter:
         resolved: ResolvedModelRoute,
     ) -> RoutedNativeMessagesRequest:
         eligible = tuple(
-            target
-            for target in resolved.fallbacks
-            if supports_native_messages(target.provider_id)
+            candidate
+            for candidate in resolved.fallbacks
+            if supports_native_messages(candidate.target.provider_id)
         )
         trace_event(
             stage="routing",
@@ -264,9 +313,9 @@ class ModelRouter:
             source="application",
             contract="native",
             excluded_fallbacks=tuple(
-                target.provider_model_ref
-                for target in resolved.fallbacks
-                if target not in eligible
+                candidate.target.provider_model_ref
+                for candidate in resolved.fallbacks
+                if candidate not in eligible
             ),
         )
         return RoutedNativeMessagesRequest(
@@ -336,5 +385,29 @@ class ModelRouter:
             reasoning=resolve_responses_reasoning_policy(
                 routed,
                 resolved.reasoning_preference,
+            ),
+        )
+
+    def resolve_gemini_request(self, request: GeminiRequest) -> RoutedGeminiRequest:
+        resolved = self.resolve(request.model)
+        return RoutedGeminiRequest(
+            request=request.model_copy(
+                update={"model": resolved.primary.provider_model}, deep=True
+            ),
+            resolved=resolved,
+            reasoning=resolve_gemini_reasoning_policy(
+                request, resolved.reasoning_preference
+            ),
+        )
+
+    def resolve_chat_request(self, request: ChatRequest) -> RoutedChatRequest:
+        resolved = self.resolve(request.model)
+        return RoutedChatRequest(
+            request=request.model_copy(
+                update={"model": resolved.primary.provider_model}, deep=True
+            ),
+            resolved=resolved,
+            reasoning=resolve_chat_reasoning_policy(
+                request, resolved.reasoning_preference
             ),
         )

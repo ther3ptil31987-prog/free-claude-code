@@ -16,7 +16,7 @@ from free_claude_code.providers.admission import (
     ProviderOperationKind,
 )
 from free_claude_code.providers.base import ProviderConfig
-from free_claude_code.providers.failure_policy import classify_provider_failure
+from free_claude_code.providers.failure_reporting import finalize_provider_failure
 from free_claude_code.providers.model_listing import (
     ModelListResponseError,
     optional_input_modalities,
@@ -224,7 +224,7 @@ class OpenCodeCatalog:
             try:
                 return await self._load_and_publish(request_id=request_id)
             except Exception as exc:
-                raise classify_provider_failure(
+                raise finalize_provider_failure(
                     exc,
                     provider_name=self._provider_name,
                     read_timeout_s=self._read_timeout,
@@ -264,7 +264,7 @@ class OpenCodeCatalog:
             finally:
                 await response.aclose()
 
-        execution = self._admission.start_execution(request_id=request_id)
+        execution = self._admission.start_execution(request_id=request_id, model=None)
         snapshot = await execution.run_call(
             request,
             operation_kind=ProviderOperationKind.MODEL_DISCOVERY,

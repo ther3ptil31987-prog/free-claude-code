@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from free_claude_code.api.app import create_app
 from free_claude_code.api.ports import ApiServices
 from free_claude_code.application.code_sessions import CodeService
+from free_claude_code.config.api_keys import first_api_key
 from free_claude_code.config.loader import ManagedConfigStore
 from free_claude_code.config.logging_config import configure_logging
 from free_claude_code.config.paths import (
@@ -21,6 +22,7 @@ from free_claude_code.core.async_tasks import run_sync_owned
 from free_claude_code.messaging.voice import Transcriber
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.github_copilot.auth import CopilotAuthManager
+from free_claude_code.providers.history_negotiation import HistoryModeCache
 from free_claude_code.providers.openai_codex.auth import OpenAIAuthManager
 from free_claude_code.providers.runtime.runtime import ProviderRuntime, create_provider
 
@@ -108,8 +110,11 @@ def _load_openai_provider(*, auth: OpenAIAuthManager) -> ProviderFactory:
         config: ProviderConfig,
         _settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return OpenAICodexProvider(config, auth=auth, admission=admission)
+        return OpenAICodexProvider(
+            config, auth=auth, admission=admission, history_cache=history_cache
+        )
 
     return construct
 
@@ -121,8 +126,11 @@ def _load_copilot_provider(*, auth: CopilotAuthManager) -> ProviderFactory:
         config: ProviderConfig,
         _settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return GitHubCopilotProvider(config, auth=auth, admission=admission)
+        return GitHubCopilotProvider(
+            config, auth=auth, admission=admission, history_cache=history_cache
+        )
 
     return construct
 
@@ -138,7 +146,9 @@ async def _create_transcriber(settings: Settings) -> Transcriber | None:
             return partial(
                 NvidiaNimTranscriber,
                 model=settings.whisper_model,
-                api_key=_required_voice_key(settings.nvidia_nim_api_key),
+                api_key=_required_voice_key(
+                    first_api_key(settings.nvidia_nim_api_keys)
+                ),
             )
         from free_claude_code.messaging.transcription import TranscriptionService
 
@@ -146,7 +156,7 @@ async def _create_transcriber(settings: Settings) -> Transcriber | None:
             TranscriptionService,
             model=settings.whisper_model,
             device=settings.whisper_device,
-            huggingface_api_key=settings.huggingface_api_key,
+            huggingface_api_key=first_api_key(settings.huggingface_api_keys),
         )
 
     constructor = await run_sync_owned(load)

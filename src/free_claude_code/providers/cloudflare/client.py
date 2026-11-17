@@ -1,21 +1,25 @@
 """Cloudflare Workers AI provider using OpenAI-compatible chat completions."""
 
+import math
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+from openai.types.chat import ChatCompletionChunk
 
 from free_claude_code.application.errors import ApplicationUnavailableError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.provider_catalog import CLOUDFLARE_AI_REST_ROOT
 from free_claude_code.core.anthropic import ReasoningReplayMode
+from free_claude_code.core.chat_completions.response import chat_failure
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
     ProviderOperationKind,
 )
 from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.history_negotiation import HistoryModeCache
 from free_claude_code.providers.http import maybe_await_aclose
 from free_claude_code.providers.model_listing import (
     ModelListResponseError,
@@ -69,6 +73,27 @@ def _cloudflare_account_api_url(api_root: str | None, account_id: str) -> str:
 class CloudflareChatBehavior(OpenAIChatBehavior):
     """Cloudflare Chat adaptation without HTTP ownership."""
 
+    def normalize_chunk(self, chunk: ChatCompletionChunk) -> ChatCompletionChunk:
+        choices = []
+        changed = False
+        for choice in getattr(chunk, "choices", None) or ():
+            content = getattr(getattr(choice, "delta", None), "content", None)
+            if content is None or isinstance(content, str):
+                choices.append(choice)
+                continue
+            # Workers AI can emit numeric text tokens as JSON numbers, even 0.
+            if type(content) is int or (
+                type(content) is float and math.isfinite(content)
+            ):
+                delta = choice.delta.model_copy(update={"content": str(content)})
+                choices.append(choice.model_copy(update={"delta": delta}))
+                changed = True
+            else:
+                raise chat_failure(
+                    "Cloudflare returned invalid text content in a Chat delta"
+                )
+        return chunk.model_copy(update={"choices": choices}) if changed else chunk
+
     def extra_reasoning_events(
         self, delta: Any, output: ChatStreamOutput, *, output_reasoning: bool
     ) -> Iterator[str]:
@@ -89,6 +114,7 @@ class CloudflareProvider(OpenAIChatProvider):
         *,
         account_id: str,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ):
         base_url = cloudflare_ai_base_url(config.base_url, account_id)
         self._model_search_url = _cloudflare_model_search_url(
@@ -107,6 +133,7 @@ class CloudflareProvider(OpenAIChatProvider):
             replace(config, base_url=base_url),
             behavior=CloudflareChatBehavior(_PROFILE),
             admission=admission,
+            history_cache=history_cache,
         )
 
     async def cleanup(self) -> None:
@@ -130,7 +157,7 @@ class CloudflareProvider(OpenAIChatProvider):
                 raise
             return response
 
-        execution = self._admission.start_execution()
+        execution = self._admission.start_execution(model=None)
         response = await execution.run_call(
             request,
             operation_kind=ProviderOperationKind.MODEL_DISCOVERY,

@@ -53,6 +53,7 @@ class LaunchCapture:
             "dsh": "0.2.0-rc.2",
             "grok": '{"currentVersion":"1.0.5"}',
             "muse": "Muse Code 1.0.3 (1.0.3-R2198.1)",
+            "agy": "1.5.9",
         }
     )
 

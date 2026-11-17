@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx as native_httpx
 import httpx2 as httpx
 import pytest
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -12,6 +13,7 @@ from openai import APIError, AsyncOpenAI, BadRequestError
 from free_claude_code.api.handlers import MessagesHandler
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.constants import ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
+from free_claude_code.config.reasoning import FALLBACK_REASONING_PREFERENCES
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import (
@@ -20,12 +22,19 @@ from free_claude_code.core.anthropic.stream_contracts import (
     thinking_content,
 )
 from free_claude_code.core.reasoning import ReasoningCapability
+from free_claude_code.providers.gemini import GeminiProvider
 from free_claude_code.providers.open_router import OpenRouterProvider
+from tests.api.model_fallback_support import (
+    ControlledFallbackProvider,
+    execution_failure,
+)
 from tests.providers.support import (
     SDKStreamDouble,
     immediate_admission,
     make_provider_config,
+    sdk_chat_chunk,
 )
+from tests.providers.test_gemini import _sse
 from tests.web_tools_support import StubWebToolsClient
 
 
@@ -44,19 +53,21 @@ class ClassifierStream(SDKStreamDouble):
             (None if self.starved else "<severity>0</severity>", None, None),
             (None, None, "length" if self.starved else "stop"),
         ):
-            yield SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        delta=SimpleNamespace(
-                            content=text,
-                            reasoning=reasoning,
-                            reasoning_content=reasoning,
-                            tool_calls=None,
-                        ),
-                        finish_reason=finish,
-                    )
-                ],
-                usage=None,
+            yield sdk_chat_chunk(
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                content=text,
+                                reasoning=reasoning,
+                                reasoning_content=reasoning,
+                                tool_calls=None,
+                            ),
+                            finish_reason=finish,
+                        )
+                    ],
+                    usage=None,
+                )
             )
 
     async def aclose(self):
@@ -80,6 +91,83 @@ def classifier_request():
             "stream": False,
         }
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "off", "limit"),
+    [
+        ("none", False, 64),
+        ("optional", True, 64),
+        ("required", False, None),
+        ("unknown", True, None),
+    ],
+)
+@pytest.mark.parametrize("rejection", [None, "mandatory", "field", "unrelated"])
+async def test_native_gemini_classifier_preserves_reasoning_preparation(
+    capability, off, limit, rejection
+):
+    bodies = []
+
+    def reply(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        config = body["generationConfig"]
+        if config["thinkingConfig"].get("thinkingBudget") == 0 and rejection:
+            error = {
+                "mandatory": {"message": "Thinking cannot be disabled"},
+                "field": {
+                    "message": "Value is not supported",
+                    "param": "generationConfig.thinkingConfig.thinkingBudget",
+                },
+                "unrelated": {"message": "Invalid tool schema", "param": "tools"},
+            }[rejection]
+            return native_httpx.Response(400, json={"error": error})
+        return _sse(
+            [
+                {"text": "Private classifier reasoning", "thought": True},
+                {"text": "<severity>0</severity>"},
+            ]
+        )
+
+    provider = GeminiProvider(
+        make_provider_config("test", "https://gemini.invalid/v1beta"),
+        admission=immediate_admission(),
+        transport=native_httpx.MockTransport(reply),
+    )
+    try:
+        response = await MessagesHandler(
+            Settings(),
+            provider_resolver=AsyncMock(return_value=provider),
+            model_info_lookup=lambda *_: ProviderModelInfo(
+                "models/gemini-2.5-flash",
+                reasoning_capability=ReasoningCapability(capability),
+            ),
+            web_tools=StubWebToolsClient(),
+        ).create(
+            classifier_request().model_copy(
+                update={"model": "gemini/models/gemini-2.5-flash"}
+            )
+        )
+        assert isinstance(response, JSONResponse)
+        if off and rejection == "unrelated":
+            assert response.status_code >= 400
+            assert len(bodies) == 1
+        else:
+            assert response.status_code == 200
+            assert json.loads(bytes(response.body))["content"] == [
+                {"type": "text", "text": "<severity>0</severity>"}
+            ]
+            assert len(bodies) == (2 if off and rejection else 1)
+        config = bodies[0]["generationConfig"]
+        assert config.get("maxOutputTokens") == limit
+        assert (config["thinkingConfig"].get("thinkingBudget") == 0) is off
+        if len(bodies) == 2:
+            retried = bodies[1]["generationConfig"]
+            assert "maxOutputTokens" not in retried
+            assert "thinkingBudget" not in retried["thinkingConfig"]
+    finally:
+        await provider.cleanup()
 
 
 @pytest.mark.asyncio
@@ -152,7 +240,9 @@ async def test_openrouter_numeric_sse_rejection_uses_classifier_correction(
     try:
         response = await MessagesHandler(
             Settings(),
-            provider_resolver=AsyncMock(side_effect=lambda _: provider),
+            provider_resolver=AsyncMock(
+                side_effect=lambda _, _api_key_number: provider
+            ),
             web_tools=StubWebToolsClient(),
         ).create(classifier_request())
         assert isinstance(response, JSONResponse)
@@ -173,18 +263,32 @@ async def test_openrouter_numeric_sse_rejection_uses_classifier_correction(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("fallback_effort", [None, *FALLBACK_REASONING_PREFERENCES])
 @pytest.mark.parametrize(
     "reject_off",
     [False, True, "stream"],
     ids=["off-ignored", "off-rejected", "off-stream-rejected"],
 )
-async def test_classifier_mandatory_reasoning_still_returns_verdict(reject_off, stream):
+async def test_classifier_mandatory_reasoning_still_returns_verdict(
+    reject_off, stream, fallback_effort
+):
     provider = OpenRouterProvider(
         make_provider_config(api_key="test", base_url="https://openrouter.test/v1"),
         admission=immediate_admission(),
     )
     bodies = []
     streams = []
+    primary = ControlledFallbackProvider(failure=execution_failure("primary failed"))
+    settings = Settings()
+    request = classifier_request().model_copy(update={"stream": stream})
+    if fallback_effort is not None:
+        settings = Settings(
+            MODEL="nvidia_nim/primary",
+            MODEL_FALLBACKS=[
+                {"model": "open_router/dynamic-route", "reasoning": fallback_effort}
+            ],
+        )
+        request = request.model_copy(update={"model": "nvidia_nim/primary"})
 
     async def upstream(**body):
         bodies.append(body)
@@ -227,8 +331,12 @@ async def test_classifier_mandatory_reasoning_still_returns_verdict(reject_off, 
 
     try:
         handler = MessagesHandler(
-            Settings(),
-            provider_resolver=AsyncMock(side_effect=lambda _: provider),
+            settings,
+            provider_resolver=AsyncMock(
+                side_effect=lambda provider_id, _api_key_number: (
+                    primary if provider_id == "nvidia_nim" else provider
+                )
+            ),
             web_tools=StubWebToolsClient(),
         )
         with patch.object(
@@ -236,9 +344,7 @@ async def test_classifier_mandatory_reasoning_still_returns_verdict(reject_off, 
             "create",
             new=AsyncMock(side_effect=upstream),
         ):
-            response = await handler.create(
-                classifier_request().model_copy(update={"stream": stream})
-            )
+            response = await handler.create(request)
             assert isinstance(response, (JSONResponse, StreamingResponse))
             assert response.status_code == 200
             if stream:
@@ -288,7 +394,9 @@ async def test_handler_uses_cached_capabilities_for_the_selected_provider(
     try:
         handler = MessagesHandler(
             Settings(),
-            provider_resolver=AsyncMock(side_effect=lambda _: provider),
+            provider_resolver=AsyncMock(
+                side_effect=lambda _, _api_key_number: provider
+            ),
             model_info_lookup=lambda provider_id, model_id: next(
                 (
                     info

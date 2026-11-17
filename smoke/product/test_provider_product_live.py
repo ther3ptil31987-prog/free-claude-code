@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ from free_claude_code.core.anthropic.stream_contracts import (
     SSEEvent,
     parse_sse_lines,
 )
+from free_claude_code.core.history_replay import decode_replay, is_replay
 from smoke.lib.config import ProviderModel, SmokeConfig
 from smoke.lib.e2e import (
     ConversationDriver,
@@ -20,6 +22,7 @@ from smoke.lib.e2e import (
     tool_use_blocks,
 )
 from smoke.lib.http import collect_message_stream, conversation_headers
+from smoke.lib.server import RunningServer
 from smoke.lib.skips import (
     skip_if_upstream_unavailable_events,
     skip_if_upstream_unavailable_exception,
@@ -65,6 +68,8 @@ def test_provider_adaptive_thinking_history_e2e(
 def test_provider_interleaved_thinking_tool_e2e(
     smoke_config: SmokeConfig, provider_model: ProviderModel
 ) -> None:
+    if provider_model.provider == "gemini":
+        pytest.skip("synthetic tool history cannot carry native Gemini signatures")
     _run_provider_scenario(smoke_config, provider_model, _scenario_interleaved_history)
 
 
@@ -73,6 +78,10 @@ def test_provider_tool_use_then_text_history_e2e(
     smoke_config: SmokeConfig, provider_model: ProviderModel
 ) -> None:
     """OpenAI-compatible path: history with tool_use + assistant text after tool (issue #206)."""
+    if provider_model.provider == "gemini":
+        pytest.skip(
+            "synthetic post-tool narration cannot carry native Gemini signatures"
+        )
     _run_provider_scenario(
         smoke_config, provider_model, _scenario_tool_use_then_text_in_history
     )
@@ -88,12 +97,10 @@ def test_provider_tool_result_continuation_e2e(
 
 
 @pytest.mark.smoke_target("tools")
-def test_provider_interrupted_tool_turn_resume_e2e(
+def test_provider_tool_history_resume_e2e(
     smoke_config: SmokeConfig, provider_model: ProviderModel
 ) -> None:
-    _run_provider_scenario(
-        smoke_config, provider_model, _scenario_interrupted_tool_turn_resume
-    )
+    _run_provider_scenario(smoke_config, provider_model, _scenario_tool_history_resume)
 
 
 @pytest.mark.smoke_target("tools")
@@ -143,6 +150,60 @@ def test_mistral_native_reasoning_model_e2e(smoke_config: SmokeConfig) -> None:
     assert_native_thinking_stream(
         events,
         context=f"{provider_model.source}={provider_model.full_model}",
+    )
+
+
+def test_mistral_prompt_cache_affinity_e2e(smoke_config: SmokeConfig) -> None:
+    """Mistral prompt caching via the x-affinity session header (merge gate).
+
+    The x-affinity mechanism is reverse-engineered from the official Mistral
+    CLI (mistral-vibe), not a public API contract. Two requests sharing one
+    session id and a long common prefix must report cache reads on the second
+    response. Cache support is model-dependent and best-effort, so the gate
+    pins a model that consistently reports cache reads and retries the
+    follow-up with escalating pauses (the cache is eventually consistent).
+    """
+    provider_model = smoke_config.mistral_cache_smoke_model()
+    if provider_model is None:
+        pytest.skip("missing_env: mistral is not configured")
+
+    headers = conversation_headers(session_id="fcc-smoke-mistral-cache-affinity")
+    first_payload = {
+        # fcc-smoke-default routes to the MODEL override (the Mistral model);
+        # tier names like claude-opus-4-7 would route to MODEL_OPUS instead.
+        "model": "fcc-smoke-default",
+        "max_tokens": 256,
+        "system": _long_cacheable_system_prompt(),
+        "messages": [{"role": "user", "content": "Say hello in one word."}],
+    }
+    second_payload = {
+        **first_payload,
+        "messages": [
+            first_payload["messages"][0],
+            {"role": "user", "content": "Now say goodbye in one word."},
+        ],
+    }
+
+    try:
+        with SmokeServerDriver(
+            smoke_config,
+            name="product-provider-mistral-prompt-cache-affinity",
+            env_overrides={
+                "MODEL": provider_model.full_model,
+                "MODEL_FALLBACKS": "",
+                "MESSAGING_PLATFORM": "none",
+            },
+        ).run() as server:
+            cached_reads = _mistral_cached_reads_with_retry(
+                server, smoke_config, headers, first_payload, second_payload
+            )
+    except Exception as exc:
+        skip_if_upstream_unavailable_exception(exc)
+        raise
+
+    assert cached_reads > 0, (
+        f"{provider_model.source}={provider_model.full_model}: "
+        "no prompt cache reads reported on the second request"
     )
 
 
@@ -295,8 +356,8 @@ def _scenario_text_multiturn(
 ) -> None:
     with _server_for_provider(smoke_config, provider_model, "text") as server:
         driver = ConversationDriver(server, smoke_config)
-        first = driver.ask("Reply with one short sentence.")
-        second = driver.ask("Reply with a different short sentence.")
+        first = driver.ask("Reply with one short sentence.", max_tokens=4096)
+        second = driver.ask("Reply with a different short sentence.", max_tokens=4096)
     _assert_provider_product_stream(first.events)
     _assert_provider_product_stream(second.events)
 
@@ -307,23 +368,27 @@ def _scenario_adaptive_thinking_history(
     payload = {
         "model": "claude-opus-4-7",
         "max_tokens": 2048,
-        "messages": [
-            {"role": "user", "content": "hello"},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "unsigned hidden thought"},
-                    {"type": "redacted_thinking", "data": "opaque"},
-                    {"type": "text", "text": "Hello."},
-                ],
-            },
-            {"role": "user", "content": "Reply with one short sentence."},
-        ],
+        "messages": [{"role": "user", "content": "Reply with one short sentence."}],
         "thinking": {"type": "adaptive", "budget_tokens": 1024},
     }
     with _server_for_provider(smoke_config, provider_model, "adaptive") as server:
-        turn = ConversationDriver(server, smoke_config).stream(payload)
-    _assert_provider_product_stream(turn.events)
+        driver = ConversationDriver(server, smoke_config)
+        first = driver.stream(payload)
+        second = driver.stream(
+            {
+                **payload,
+                "messages": [
+                    *payload["messages"],
+                    {"role": "assistant", "content": first.assistant_content},
+                    {
+                        "role": "user",
+                        "content": "Reply with a different short sentence.",
+                    },
+                ],
+            }
+        )
+    _assert_provider_product_stream(first.events)
+    _assert_provider_product_stream(second.events)
 
 
 def _scenario_interleaved_history(
@@ -456,49 +521,54 @@ def _scenario_tool_result_continuation(
     _assert_provider_product_stream(second.events)
 
 
-def _scenario_interrupted_tool_turn_resume(
+def _scenario_tool_history_resume(
     smoke_config: SmokeConfig, provider_model: ProviderModel
 ) -> None:
-    tool_id = "toolu_interrupted123456789"
-    payload = {
+    first_payload = {
         "model": "claude-sonnet-4-5-20250929",
         "max_tokens": 256,
-        "stream": True,
         "messages": [
-            {"role": "user", "content": "Use echo_smoke with value FCC_INTERRUPTED."},
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": tool_id,
-                        "name": "echo_smoke",
-                        "input": {"value": "FCC_INTERRUPTED"},
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": "FCC_INTERRUPTED",
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": "Reply exactly OK without calling tools.",
-            },
+            {"role": "user", "content": "Use echo_smoke with value FCC_RESUME."}
         ],
         "tools": [echo_tool_schema()],
+        "tool_choice": {"type": "tool", "name": "echo_smoke"},
+        "thinking": {"type": "adaptive"},
     }
     with _server_for_provider(
-        smoke_config, provider_model, "interrupted-tool-turn"
+        smoke_config, provider_model, "tool-history-resume"
     ) as server:
-        turn = ConversationDriver(server, smoke_config).stream(payload)
-    _assert_provider_product_stream(turn.events)
+        driver = ConversationDriver(server, smoke_config)
+        first = driver.stream(first_payload)
+        tool_use = _tool_use_blocks_or_skip(
+            first.events, "provider did not emit a tool_use block"
+        )[0]
+        second = driver.stream(
+            {
+                "model": first_payload["model"],
+                "max_tokens": 256,
+                "messages": [
+                    *first_payload["messages"],
+                    {"role": "assistant", "content": first.assistant_content},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use["id"],
+                                "content": "FCC_RESUME",
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": "Reply exactly OK without calling tools.",
+                    },
+                ],
+                "tools": first_payload["tools"],
+            }
+        )
+    _assert_provider_product_stream(first.events)
+    _assert_provider_product_stream(second.events)
 
 
 def _scenario_gemini_thought_signature_tool_continuation(
@@ -523,10 +593,16 @@ def _scenario_gemini_thought_signature_tool_continuation(
             first.events, "gemini did not emit a tool_use block"
         )
         tool_use = tool_uses[0]
-        signature = _gemini_tool_thought_signature(tool_use)
-        assert signature, (
-            "gemini tool_use did not preserve extra_content.google.thought_signature"
-        )
+        records = [
+            decode_replay(block["data"])
+            for block in first.assistant_content
+            if block.get("type") == "redacted_thinking" and is_replay(block.get("data"))
+        ]
+        assert any(
+            part.get("thoughtSignature")
+            for record in records
+            for part in record.native.get("parts", [])
+        ), "gemini tool turn did not preserve its native thought signature"
         second_payload = {
             "model": "claude-sonnet-4-5-20250929",
             "max_tokens": 256,
@@ -550,17 +626,6 @@ def _scenario_gemini_thought_signature_tool_continuation(
         second = driver.stream(second_payload)
     _assert_provider_product_stream(first.events)
     _assert_provider_product_stream(second.events)
-
-
-def _gemini_tool_thought_signature(tool_use: dict[str, Any]) -> str | None:
-    extra_content = tool_use.get("extra_content")
-    if not isinstance(extra_content, dict):
-        return None
-    google = extra_content.get("google")
-    if not isinstance(google, dict):
-        return None
-    signature = google.get("thought_signature")
-    return signature if isinstance(signature, str) and signature else None
 
 
 def _scenario_reasoning_tool_continuation(
@@ -624,7 +689,7 @@ def _scenario_disconnect(
         health = httpx.get(f"{server.base_url}/health", timeout=5)
         assert health.status_code == 200
         followup = ConversationDriver(server, smoke_config).ask(
-            "Reply with one short sentence.", headers=headers
+            "Reply with one short sentence.", max_tokens=4096, headers=headers
         )
     _assert_provider_product_stream(followup.events)
 
@@ -638,6 +703,13 @@ def _server_for_provider(
         env_overrides={
             "MODEL": provider_model.full_model,
             "MESSAGING_PLATFORM": "none",
+            "MODEL_FALLBACKS": "",
+            "REASONING_POLICY": "client",
+            **{f"MODEL_{tier}": "" for tier in ("FABLE", "OPUS", "SONNET", "HAIKU")},
+            **{
+                f"REASONING_{tier}": "inherit"
+                for tier in ("FABLE", "OPUS", "SONNET", "HAIKU")
+            },
         },
     ).run()
 
@@ -648,3 +720,58 @@ def _openai_auth_headers(smoke_config: SmokeConfig) -> dict[str, str]:
     if token:
         headers["authorization"] = f"Bearer {token}"
     return conversation_headers(headers)
+
+
+def _long_cacheable_system_prompt() -> str:
+    """Build a deterministic system prompt far above the minimum cacheable prefix."""
+    paragraph = (
+        "You are a concise assistant in a long-running support conversation. "
+        "Answer every question with a single short sentence and nothing else. "
+    )
+    return paragraph * 40
+
+
+def _mistral_cached_reads_with_retry(
+    server: RunningServer,
+    smoke_config: SmokeConfig,
+    headers: dict[str, str],
+    first_payload: dict[str, Any],
+    second_payload: dict[str, Any],
+    *,
+    read_pauses_s: tuple[float, ...] = (3, 3, 5, 8, 13, 21),
+) -> int:
+    """Warm the cache, then return follow-up cache reads, retrying misses.
+
+    Mistral prompt caching is best-effort and eventually consistent: the
+    warm request's cache write becomes visible to later requests only after
+    a variable delay (observed from ~3s to ~25s). The first probe matches the
+    observed minimum propagation (~3s); later pauses escalate, so the probes
+    land at ~3, 6, 11, 19, 32, and 53s after the warm request and the final
+    probe covers the observed upper bound with margin.
+    """
+    warm_events = collect_message_stream(
+        server, first_payload, smoke_config, headers=headers
+    )
+    skip_if_upstream_unavailable_events(warm_events)
+    for pause_s in read_pauses_s:
+        time.sleep(pause_s)
+        followup_events = collect_message_stream(
+            server, second_payload, smoke_config, headers=headers
+        )
+        skip_if_upstream_unavailable_events(followup_events)
+        cached_reads = _cache_read_input_tokens(followup_events)
+        if cached_reads > 0:
+            return cached_reads
+    return 0
+
+
+def _cache_read_input_tokens(events: list[SSEEvent]) -> int:
+    for event in events:
+        if event.event != "message_delta":
+            continue
+        usage = event.data.get("usage")
+        if isinstance(usage, dict):
+            cached = usage.get("cache_read_input_tokens")
+            if isinstance(cached, int) and not isinstance(cached, bool):
+                return cached
+    return 0

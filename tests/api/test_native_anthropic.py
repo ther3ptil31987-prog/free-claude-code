@@ -8,10 +8,66 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from free_claude_code.config.model_refs import ModelFallback
 from free_claude_code.config.settings import Settings
 from free_claude_code.providers.base import BaseProvider
 from tests.api.support import create_test_app
+from tests.providers.support import without_empty_reasoning
+from tests.providers.test_anthropic_fallback_reasoning import model_metadata
 from tests.providers.test_anthropic_provider import native_body, provider
+
+
+@pytest.mark.parametrize("effort", ["inherit", "client", "off", "low", "high", "max"])
+def test_native_fallback_applies_selected_effort_after_passthrough_primary(effort):
+    sent = []
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=model_metadata() | {"id": "backup"})
+        body = json.loads(request.content)
+        sent.append(body)
+        if body["model"] == "primary":
+            return httpx.Response(
+                403,
+                json={"error": {"type": "permission_error", "message": "unavailable"}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "stop_reason": "end_turn",
+                "type": "message",
+                "model": "backup",
+                "content": [],
+            },
+        )
+
+    app = create_test_app(
+        Settings(
+            MODEL="anthropic/primary",
+            MODEL_FALLBACKS=[{"model": "anthropic/backup", "reasoning": effort}],
+        ),
+        providers={"anthropic": provider(handle)},
+    )
+    body = native_body()
+    body["thinking"] = {"type": "enabled", "budget_tokens": 6000, "display": "omitted"}
+    body["output_config"] = {"effort": "medium", "format": {"type": "json_schema"}}
+    with TestClient(app) as client:
+        response = client.post("/v1/messages", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == body["model"]
+    assert without_empty_reasoning(sent[0]) == body | {"model": "primary"}
+    assert (
+        without_empty_reasoning(sent[1]["messages"]) == body["messages"]
+        and sent[1]["tools"] == body["tools"]
+    )
+    if effort in {"inherit", "client"}:
+        assert without_empty_reasoning(sent[1]) == body | {"model": "backup"}
+    elif effort == "off":
+        assert sent[1]["thinking"] == {"type": "disabled"}
+        assert sent[1]["output_config"] == {"format": {"type": "json_schema"}}
+    else:
+        assert sent[1]["thinking"] == {"type": "adaptive", "display": "omitted"}
+        assert sent[1]["output_config"]["effort"] == effort
 
 
 def test_native_ingress_preserves_extensions_and_bypasses_local_processing():
@@ -40,10 +96,6 @@ def test_native_ingress_preserves_extensions_and_bypasses_local_processing():
     body["model"] = "claude-sonnet-client-alias"
     with (
         patch(
-            "free_claude_code.api.handlers.messages.try_optimizations",
-            side_effect=AssertionError("native optimization"),
-        ),
-        patch(
             "free_claude_code.runtime.provider_manager.ProviderGenerationLease.wait_for_token_estimation",
             side_effect=AssertionError("native token wait"),
         ),
@@ -61,7 +113,42 @@ def test_native_ingress_preserves_extensions_and_bypasses_local_processing():
     assert response.status_code == 200, response.text
     assert response.json()["model"] == body["model"]
     assert response.json()["stop_reason"] == "pause_turn"
-    assert sent == [{**body, "model": "claude-test"}]
+    assert without_empty_reasoning(sent) == [{**body, "model": "claude-test"}]
+
+
+def test_native_ingress_forwards_system_turns_for_upstream_to_judge():
+    sent = []
+
+    def handle(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "type": "message",
+                "model": "claude-test",
+                "content": [],
+                "stop_reason": "end_turn",
+            },
+        )
+
+    app = create_test_app(
+        Settings(MODEL="anthropic/claude-test", ANTHROPIC_API_KEY="key"),
+        providers={"anthropic": provider(handle)},
+    )
+    body = native_body()
+    body["messages"] = [
+        *body["messages"],
+        {"role": "system", "content": "reminder", "clear_at": "next_user_message"},
+        {"role": "user", "content": "again"},
+    ]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"User-Agent": "claude-cli/2.1.288 (external, cli)"},
+            json=body,
+        )
+    assert response.status_code == 200, response.text
+    assert without_empty_reasoning(sent[0])["messages"] == body["messages"]
 
 
 def test_native_fallback_excludes_compatibility_and_preserves_alias():
@@ -79,13 +166,22 @@ def test_native_fallback_excludes_compatibility_and_preserves_alias():
                 },
             )
         return httpx.Response(
-            200, json={"type": "message", "model": "backup", "content": []}
+            200,
+            json={
+                "stop_reason": "end_turn",
+                "type": "message",
+                "model": "backup",
+                "content": [],
+            },
         )
 
     settings = Settings(
         MODEL="anthropic/primary",
         ANTHROPIC_API_KEY="key",
-        MODEL_FALLBACKS=["nvidia_nim/never", "anthropic/backup"],
+        MODEL_FALLBACKS=[
+            ModelFallback(model="nvidia_nim/never"),
+            ModelFallback(model="anthropic/backup"),
+        ],
     )
     app = create_test_app(settings, providers={"anthropic": provider(handle)})
     body = native_body()
@@ -128,7 +224,10 @@ def test_leading_pings_allow_exhausted_primary_to_reach_native_fallback():
     app = create_test_app(
         Settings(
             MODEL="anthropic/primary",
-            MODEL_FALLBACKS=["nvidia_nim/excluded", "anthropic/backup"],
+            MODEL_FALLBACKS=[
+                ModelFallback(model="nvidia_nim/excluded"),
+                ModelFallback(model="anthropic/backup"),
+            ],
         ),
         providers={"anthropic": provider(handle)},
     )
@@ -168,7 +267,7 @@ def test_stream_failure_after_metadata_exhausts_then_uses_fallback():
     settings = Settings(
         MODEL="anthropic/primary",
         ANTHROPIC_API_KEY="key",
-        MODEL_FALLBACKS=["anthropic/backup"],
+        MODEL_FALLBACKS=[ModelFallback(model="anthropic/backup")],
     )
     app = create_test_app(settings, providers={"anthropic": provider(handle)})
     with TestClient(app) as client:
@@ -216,7 +315,9 @@ def test_native_proxy_auth_remains_separate_from_upstream_key():
 
     def handle(request):
         calls.append(request)
-        return httpx.Response(200, json={"type": "message", "content": []})
+        return httpx.Response(
+            200, json={"stop_reason": "end_turn", "type": "message", "content": []}
+        )
 
     settings = Settings(
         MODEL="anthropic/selected",
@@ -264,7 +365,7 @@ def test_compatibility_primary_keeps_conversion_when_anthropic_is_fallback():
     settings = Settings(
         MODEL="nvidia_nim/primary",
         ANTHROPIC_API_KEY="key",
-        MODEL_FALLBACKS=["anthropic/backup"],
+        MODEL_FALLBACKS=[ModelFallback(model="anthropic/backup")],
         REASONING_POLICY="off",
     )
     p = provider(handle)

@@ -13,23 +13,18 @@ LOGIN = "claudeCode.disableLoginPrompt"
 
 
 def operate(path, connected=None):
-    result = claude_integration.configure(
-        path, path.parent / ".claude.json", URL, TOKEN, connected
-    )
+    result = claude_integration.configure(path, URL, TOKEN, connected)
     return {"connected": result["connected"]}
 
 
-def test_connect_completes_onboarding_and_disconnect_preserves_state(tmp_path):
+def test_vscode_operations_preserve_global_state(tmp_path):
     path = tmp_path / "settings.json"
     state_path = tmp_path / ".claude.json"
     state_path.write_text('{"theme":"dark","hasCompletedOnboarding":false}')
     assert operate(path, True) == {"connected": True}
-    assert json.loads(state_path.read_text()) == {
-        "theme": "dark",
-        "hasCompletedOnboarding": True,
-    }
     saved = state_path.read_bytes()
     modified = state_path.stat().st_mtime_ns
+    assert operate(path) == {"connected": True}
     operate(path, True)
     assert state_path.stat().st_mtime_ns == modified
     assert operate(path, False) == {"connected": False}
@@ -37,40 +32,38 @@ def test_connect_completes_onboarding_and_disconnect_preserves_state(tmp_path):
 
 
 @pytest.mark.parametrize("flag", [None, False, 1, "true"])
-def test_connected_requires_completed_onboarding(tmp_path, flag):
+def test_connection_is_independent_of_onboarding(tmp_path, flag):
     path = tmp_path / "settings.json"
     state_path = tmp_path / ".claude.json"
     operate(path, True)
     state_path.write_text(json.dumps({"hasCompletedOnboarding": flag}))
-    assert operate(path) == {"connected": False}
+    assert operate(path) == {"connected": True}
     operate(path, True)
-    assert json.loads(state_path.read_text())["hasCompletedOnboarding"] is True
+    assert json.loads(state_path.read_text())["hasCompletedOnboarding"] == flag
     assert operate(path) == {"connected": True}
 
 
-def test_missing_onboarding_state_is_read_only_until_connect(tmp_path):
+def test_vscode_operations_do_not_create_global_state(tmp_path):
     path = tmp_path / "settings.json"
     state_path = tmp_path / ".claude.json"
     operate(path, True)
-    state_path.unlink()
-    assert operate(path) == {"connected": False}
+    assert operate(path) == {"connected": True}
     assert not state_path.exists()
     assert operate(path, False) == {"connected": False}
     assert not state_path.exists()
     operate(path, True)
-    assert json.loads(state_path.read_text()) == {"hasCompletedOnboarding": True}
+    assert not state_path.exists()
 
 
 @pytest.mark.parametrize("source", ["{invalid", "[]", '{"a":1,"a":2}', '{"a":NaN}'])
-def test_invalid_state_blocks_connect_but_not_disconnect(tmp_path, source):
+def test_invalid_global_state_does_not_affect_vscode(tmp_path, source):
     path = tmp_path / "settings.json"
     state_path = tmp_path / ".claude.json"
     operate(path, True)
     settings_before = path.read_bytes()
     state_path.write_text(source)
     for action in (None, True):
-        with pytest.raises(ValueError):
-            operate(path, action)
+        assert operate(path, action) == {"connected": True}
         assert path.read_bytes() == settings_before
         assert state_path.read_text() == source
     assert operate(path, False) == {"connected": False}
@@ -88,52 +81,6 @@ def test_invalid_vscode_settings_do_not_update_onboarding(tmp_path):
     assert state_path.read_text() == '{"hasCompletedOnboarding":false}'
 
 
-@pytest.mark.parametrize("failed_file", ["state", "settings"])
-def test_save_failure_preserves_completed_steps_and_retry_completes(
-    tmp_path, monkeypatch, failed_file
-):
-    path = tmp_path / "settings.json"
-    state_path = tmp_path / ".claude.json"
-    path.write_text('{"keep":true}')
-    original_replace = Path.replace
-
-    def fail_replace(self, target):
-        if target == (state_path if failed_file == "state" else path):
-            raise PermissionError("test failure")
-        return original_replace(self, target)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(Path, "replace", fail_replace)
-        with pytest.raises(OSError):
-            operate(path, True)
-    if failed_file == "state":
-        assert not state_path.exists()
-    else:
-        assert json.loads(state_path.read_text())["hasCompletedOnboarding"] is True
-    assert path.read_text() == '{"keep":true}'
-    assert operate(path) == {"connected": False}
-    assert operate(path, True) == {"connected": True}
-
-
-def test_onboarding_symlink_and_escaped_unicode_are_preserved(tmp_path):
-    path = tmp_path / "settings.json"
-    state_path = tmp_path / ".claude.json"
-    target = tmp_path / "state.json"
-    target.write_text(json.dumps({"keep": "\U0001f600"}))
-    try:
-        state_path.symlink_to(Path("state.json"))
-    except OSError as exc:
-        if getattr(exc, "winerror", None) == 1314:
-            pytest.skip("Windows symlink creation requires Developer Mode or privilege")
-        raise
-    assert operate(path, True) == {"connected": True}
-    assert state_path.is_symlink()
-    assert json.loads(target.read_text()) == {
-        "keep": "\U0001f600",
-        "hasCompletedOnboarding": True,
-    }
-
-
 def test_connect_merges_jsonc_and_disconnect_preserves_unrelated_values(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(
@@ -145,6 +92,10 @@ def test_connect_merges_jsonc_and_disconnect_preserves_unrelated_values(tmp_path
         {"name": "ANTHROPIC_AUTH_TOKEN", "value": "old", "extra": "keep"},
         {"name": "CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "value": "0"},
         {"name": "CLAUDE_CODE_AUTO_MODE_SERVER", "value": "1"},
+        {"name": "CLAUDE_CODE_MAX_RETRIES", "value": "10"},
+        {"name": "CLAUDE_CODE_RETRY_WATCHDOG", "value": "1"},
+        {"name": "CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES", "value": "2"},
+        {"name": "API_TIMEOUT_MS", "value": "1000"},
       ],
     }""",
         encoding="utf-8",
@@ -161,7 +112,13 @@ def test_connect_merges_jsonc_and_disconnect_preserves_unrelated_values(tmp_path
         "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
         "CLAUDE_CODE_AUTO_MODE_SERVER",
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-        "DISABLE_AUTOUPDATER",
+        "CLAUDE_ENABLE_STREAM_WATCHDOG",
+        "CLAUDE_ENABLE_BYTE_WATCHDOG",
+        "API_FORCE_IDLE_TIMEOUT",
+        "CLAUDE_CODE_MAX_RETRIES",
+        "CLAUDE_CODE_RETRY_WATCHDOG",
+        "CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES",
+        "API_TIMEOUT_MS",
         "DISABLE_FEEDBACK_COMMAND",
         "DISABLE_ERROR_REPORTING",
     }
@@ -173,11 +130,26 @@ def test_connect_merges_jsonc_and_disconnect_preserves_unrelated_values(tmp_path
     assert entries["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]["value"] == "190000"
     assert entries["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"]["value"] == "1"
     assert entries["CLAUDE_CODE_AUTO_MODE_SERVER"]["value"] == "0"
+    for name in (
+        "CLAUDE_ENABLE_STREAM_WATCHDOG",
+        "CLAUDE_ENABLE_BYTE_WATCHDOG",
+        "API_FORCE_IDLE_TIMEOUT",
+    ):
+        assert entries[name]["value"] == "0"
+    assert entries["CLAUDE_CODE_MAX_RETRIES"]["value"] == "10"
+    assert entries["CLAUDE_CODE_RETRY_WATCHDOG"]["value"] == "1"
+    assert entries["CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES"]["value"] == "2"
+    assert entries["API_TIMEOUT_MS"]["value"] == "2147483647"
     assert "//" not in path.read_text().replace("http://", "")
     assert operate(path, False) == {"connected": False}
     assert json.loads(path.read_text()) == {
         "editor.fontSize": 16,
-        ENV: [{"name": "KEEP", "value": "yes"}],
+        ENV: [
+            {"name": "KEEP", "value": "yes"},
+            {"name": "CLAUDE_CODE_MAX_RETRIES", "value": "10"},
+            {"name": "CLAUDE_CODE_RETRY_WATCHDOG", "value": "1"},
+            {"name": "CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES", "value": "2"},
+        ],
     }
 
 
@@ -240,7 +212,6 @@ def test_settings_symlink_is_preserved(tmp_path, connected, target_exists):
 @pytest.mark.parametrize("url", ["http://localhost:8000/", URL, "http://[::1]:8000"])
 def test_manual_setup_only_requires_connection_fields(tmp_path, url):
     path = tmp_path / "settings.json"
-    (tmp_path / ".claude.json").write_text('{"hasCompletedOnboarding":true}')
     path.write_text(
         json.dumps(
             {
@@ -262,6 +233,40 @@ def test_manual_setup_only_requires_connection_fields(tmp_path, url):
         entry["name"]: entry["value"] for entry in json.loads(path.read_text())[ENV]
     }
     assert entries["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+
+
+def test_refresh_connected_extends_waiting_without_changing_retries(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                LOGIN: True,
+                ENV: [
+                    {"name": "ANTHROPIC_BASE_URL", "value": URL},
+                    {"name": "ANTHROPIC_AUTH_TOKEN", "value": TOKEN},
+                    {
+                        "name": "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+                        "value": "1",
+                    },
+                    {"name": "CLAUDE_CODE_MAX_RETRIES", "value": "10"},
+                    {"name": "API_TIMEOUT_MS", "value": "1000"},
+                    {"name": "KEEP", "value": "yes"},
+                ],
+            }
+        )
+    )
+
+    assert claude_integration.refresh_connected(path, URL, TOKEN)
+    entries = {
+        entry["name"]: entry["value"] for entry in json.loads(path.read_text())[ENV]
+    }
+    assert entries["CLAUDE_CODE_MAX_RETRIES"] == "10"
+    assert entries["API_TIMEOUT_MS"] == "2147483647"
+    assert entries["CLAUDE_ENABLE_STREAM_WATCHDOG"] == "0"
+    assert entries["CLAUDE_ENABLE_BYTE_WATCHDOG"] == "0"
+    assert entries["API_FORCE_IDLE_TIMEOUT"] == "0"
+    assert entries["KEEP"] == "yes"
+    assert not claude_integration.refresh_connected(path, URL, TOKEN)
 
 
 @pytest.mark.parametrize(

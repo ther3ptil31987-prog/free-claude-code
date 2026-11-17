@@ -56,13 +56,45 @@ catalog/docs and can be overridden with `FCC_SMOKE_MODEL_<PROVIDER>`, for exampl
 configured, live product smoke fails as `missing_env` unless you explicitly set
 `FCC_ALLOW_NO_PROVIDER_SMOKE=1`.
 
+### Focused free-provider run
+
+Select models explicitly for a bounded provider run. Before running, refresh each
+provider's model catalog and verify that each selected ID is present and eligible
+under your account's free allowance. Catalog access alone does not establish free
+inference. Stop if a selection is unavailable rather than substituting a model.
+
+These selections were verified on 2026-11-13. Mistral was excluded because its
+inference endpoint returned 429, even though its catalog was accessible.
+
+```powershell
+$env:FCC_LIVE_SMOKE = "1"
+$env:FCC_SMOKE_TARGETS = "providers,tools,rate_limit"
+$env:FCC_SMOKE_PROVIDER_MATRIX = "nvidia_nim,open_router,groq,gemini,cloudflare"
+$env:FCC_SMOKE_MODEL_NVIDIA_NIM = "nvidia/nemotron-3.5-lightning-30b-a3b"
+$env:FCC_SMOKE_MODEL_OPEN_ROUTER = "nvidia/nemotron-3.5-lightning:free"
+$env:FCC_SMOKE_MODEL_GROQ = "openai/gpt-oss-20b"
+$env:FCC_SMOKE_MODEL_GEMINI = "models/gemini-3.1-flash-lite"
+$env:FCC_SMOKE_MODEL_CLOUDFLARE = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+uv run pytest smoke/product/test_provider_product_live.py -n 3 --dist=loadgroup -v --tb=short -k "text_multiturn or adaptive_thinking_history or interleaved_thinking_tool or tool_use_then_text_history or tool_result_continuation or tool_history_resume or provider_disconnect or gemini_thought_signature"
+```
+
+These provider scenarios isolate tier routes, fallbacks, and reasoning overrides
+inside each test server. They cover generated conversation history and tool-result
+continuation. The tool-history resume case reuses a completed assistant turn. It
+does not simulate disconnecting halfway through a tool call. Gemini uses real
+signed history and skips the two synthetic Chat history-shape cases.
+
+Provider grouping requires the compatible pytest/xdist versions in `uv.lock`.
+The scheduling contract test verifies actual worker assignments. Keep the lock
+and development dependency constraints together when upgrading the test runner.
+
 ## Targets
 
 Default targets do not send real bot messages or load voice backends:
 
 | Target | Product scenarios | Required environment |
 | --- | --- | --- |
-| `api` | messages, count_tokens full payload, errors, `/stop`, optimizations | configured provider only for streaming messages |
+| `api` | messages, count_tokens full payload, errors, `/stop` | configured provider for streaming and non-streaming messages |
 | `auth` | canonical bearer auth, conflicting legacy headers, invalid/missing auth | none; test sets an isolated token |
 | `cli` | server entrypoint, Claude CLI adaptive thinking, automatic WebSearch, Auto-mode classifier, session cleanup | Claude CLI binary and provider only for real CLI; connected OpenAI account for Auto mode; `FCC_SMOKE_RUN_WEB_TOOLS=1` for WebSearch |
 | `clients` | VS Code and JetBrains protocol payloads; Pi, OpenCode, Aider, Cline, Hermes, DeepSeek Harness, Grok Build, and Muse Code CLI prompts | configured provider; installed Pi/OpenCode/Aider/Cline binaries; Hermes, DSH, Grok, and Muse use a local fake upstream |
@@ -112,7 +144,7 @@ uv run pytest smoke/product -n 0 -s --tb=short
 ```powershell
 $env:FCC_LIVE_SMOKE = "1"
 $env:FCC_SMOKE_TARGETS = "nvidia_nim_cli"
-$env:FCC_SMOKE_NIM_MODELS = "nvidia/nemotron-3.5-lightning-30b-a3b,moonshotai/kimi-k3,minimaxai/minimax-m3,nvidia/nemotron-3-super-120b-a12b"
+$env:FCC_SMOKE_NIM_MODELS = "nvidia/nemotron-3.5-lightning-30b-a3b,moonshotai/kimi-k3,minimaxai/minimax-m3.1-flash,nvidia/nemotron-3-ultra-550b-a55b"
 uv run pytest smoke/product -n 0 -s --tb=short
 ```
 

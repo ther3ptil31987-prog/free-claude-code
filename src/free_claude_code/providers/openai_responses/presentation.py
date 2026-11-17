@@ -1,10 +1,10 @@
 """Client-protocol presenters for the shared Responses transport."""
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from typing import Protocol
 
 from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.history_replay import ReplayOrigin
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.openai_responses import (
     NativeResponsesRelay,
@@ -125,11 +125,6 @@ class NativeResponsesPresenter:
         return self._relay.failure_payload(failure)
 
 
-@dataclass(slots=True)
-class ResponsesExecutionOutcome:
-    """Provider outcome retained when terminal failure is consumed on-wire."""
-
-    failure: Exception | None = None
-
-
-type ResponsesPresenterFactory = Callable[[bool], ResponsesStreamPresenter]
+type ResponsesPresenterFactory = Callable[
+    [bool, ReplayOrigin], ResponsesStreamPresenter
+]

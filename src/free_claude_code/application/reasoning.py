@@ -4,6 +4,8 @@ from collections.abc import Mapping
 
 from free_claude_code.config.reasoning import ReasoningPreference
 from free_claude_code.core.anthropic.models import MessagesRequest, ThinkingConfig
+from free_claude_code.core.chat_completions.request import ChatRequest
+from free_claude_code.core.gemini import GeminiRequest
 from free_claude_code.core.openai_responses import (
     OpenAIResponsesRequest,
     responses_reasoning_policy,
@@ -37,6 +39,73 @@ def resolve_responses_reasoning_policy(
         client_responses_reasoning_policy(request),
         preference,
     )
+
+
+def resolve_fallback_reasoning(
+    original: ReasoningPolicy,
+    preference: ReasoningPreference,
+    *,
+    client: ReasoningPolicy,
+) -> ReasoningPolicy:
+    """Resolve a candidate from original intent, never a previous fallback."""
+
+    # Classifier requests keep the handler's tolerant policy on every candidate.
+    if original.control is ReasoningControl.PREFER_OFF:
+        return original
+    if preference is ReasoningPreference.INHERIT:
+        return original
+    if preference is ReasoningPreference.CLIENT:
+        return client
+    return _apply_reasoning_preference(original, preference)
+
+
+def resolve_gemini_reasoning_policy(
+    request: GeminiRequest,
+    preference: ReasoningPreference,
+) -> ReasoningPolicy:
+    return _apply_reasoning_preference(request.reasoning_policy(), preference)
+
+
+def client_chat_reasoning_policy(request: ChatRequest) -> ReasoningPolicy:
+    return responses_reasoning_policy({"effort": request.reasoning_effort})
+
+
+def resolve_chat_reasoning_policy(
+    request: ChatRequest, preference: ReasoningPreference
+) -> ReasoningPolicy:
+    return _apply_reasoning_preference(
+        client_chat_reasoning_policy(request), preference
+    )
+
+
+def prepare_fallback_request[
+    T: MessagesRequest | OpenAIResponsesRequest | GeminiRequest | ChatRequest
+](original: T, *, model: str, preference: ReasoningPreference) -> T:
+    """Copy a candidate and remove computation controls replaced by its policy."""
+
+    request = original.model_copy(update={"model": model}, deep=True)
+    if preference in {ReasoningPreference.INHERIT, ReasoningPreference.CLIENT}:
+        return request
+    if isinstance(request, MessagesRequest):
+        if request.thinking is not None:
+            thinking = request.thinking.model_dump(exclude_unset=True)
+            for key in ("type", "enabled", "budget_tokens"):
+                thinking.pop(key, None)
+            request.thinking = (
+                ThinkingConfig.model_validate(thinking) if thinking else None
+            )
+        if request.output_config is not None:
+            request.output_config.pop("effort", None)
+    elif isinstance(request, GeminiRequest):
+        thinking = request.generation_config.thinking_config
+        thinking.thinking_budget = None
+        thinking.thinking_level = None
+    elif isinstance(request, ChatRequest):
+        request.reasoning_effort = None
+        request.model_fields_set.discard("reasoning_effort")
+    elif request.reasoning is not None:
+        request.reasoning.pop("effort", None)
+    return request
 
 
 def _apply_reasoning_preference(

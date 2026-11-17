@@ -24,13 +24,14 @@ def get_settings(services: ApiServices = Depends(get_services)) -> Settings:
 
 async def resolve_provider(
     provider_type: str,
+    api_key_number: int = 1,
     *,
     lease: RequestRuntimeLease,
 ) -> ProviderPort:
     """Resolve a provider through one retained generation."""
-    should_log_init = not lease.is_provider_cached(provider_type)
+    should_log_init = not lease.is_provider_cached(provider_type, api_key_number)
     try:
-        provider = await lease.resolve_provider(provider_type)
+        provider = await lease.resolve_provider(provider_type, api_key_number)
     except UnknownProviderError:
         logger.error(
             "Unknown provider_type: '{}'. Supported: {}",
@@ -39,7 +40,7 @@ async def resolve_provider(
         )
         raise
     if should_log_init:
-        logger.info("Provider initialized: {}", provider_type)
+        logger.info("Provider initialized: {} Key {}", provider_type, api_key_number)
     return provider
 
 
@@ -105,6 +106,35 @@ def require_anthropic_proxy_auth(
         raise HTTPException(
             status_code=401,
             detail="Invalid proxy authentication token",
+        )
+
+
+def require_gemini_proxy_auth(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> None:
+    keys = request.query_params.getlist("key")
+    if len(keys) > 1:
+        raise HTTPException(
+            status_code=400, detail="Repeated key query credentials are unsupported"
+        )
+    if not settings.proxy_auth_enabled:
+        return
+    credential = request.headers.get("authorization")
+    bearer = credential is not None
+    if credential is None:
+        credential = request.headers.get("x-goog-api-key")
+    if credential is None:
+        credential = keys[0] if keys else None
+    if credential is None:
+        raise HTTPException(
+            status_code=401, detail="Missing proxy authentication token"
+        )
+    if not _proxy_token_matches(
+        credential, settings.proxy_auth_token, require_bearer=bearer
+    ):
+        raise HTTPException(
+            status_code=401, detail="Invalid proxy authentication token"
         )
 
 

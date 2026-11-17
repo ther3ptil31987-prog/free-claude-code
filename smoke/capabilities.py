@@ -226,7 +226,7 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
             "tests/api/test_ordinary_error_phases.py",
             "tests/core/test_failure_protocol_mapping.py",
             "tests/providers/test_execution_failure_boundary.py",
-            "tests/providers/test_failure_policy.py",
+            "tests/providers/test_failure_reporting.py",
         ),
     ),
     CapabilityContract(
@@ -293,20 +293,6 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
         "arguments preserved with normal alias restoration",
         "ordinary tool validation and recovery",
         ("tests/providers/test_subagent_interception.py",),
-    ),
-    CapabilityContract(
-        "request_behavior",
-        "local_optimizations",
-        "request_optimization",
-        "free_claude_code.api.optimization_handlers",
-        "Claude Code probe/title/suggestion/filepath requests",
-        "local MessagesResponse without provider call",
-        "falls through to provider when unmatched/disabled",
-        (
-            "tests/api/test_optimization_handlers.py",
-            "tests/api/test_routes_optimizations.py",
-        ),
-        ("test_optimization_fast_paths_do_not_need_provider",),
     ),
     CapabilityContract(
         "request_behavior",

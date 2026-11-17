@@ -11,6 +11,7 @@ from free_claude_code.config.custom_providers import (
     encode_custom_providers,
 )
 from free_claude_code.config.loader import ConfigSource, ManagedConfigSnapshot
+from free_claude_code.config.model_refs import decode_model_fallbacks
 from free_claude_code.core.json_types import JsonObject
 
 
@@ -43,21 +44,23 @@ def merge_custom_provider(
         if mutation.action == "delete":
             if mutation.values:
                 raise ValueError("Removal does not accept field edits")
-            references = [
-                key
-                for key in (
-                    "MODEL",
-                    "MODEL_FABLE",
-                    "MODEL_OPUS",
-                    "MODEL_SONNET",
-                    "MODEL_HAIKU",
-                    "MODEL_FALLBACKS",
+            references = []
+            for key in (
+                "MODEL",
+                "MODEL_FABLE",
+                "MODEL_OPUS",
+                "MODEL_SONNET",
+                "MODEL_HAIKU",
+                "MODEL_FALLBACKS",
+            ):
+                value = snapshot.process.get(key, target.get(key, ""))
+                refs = (
+                    tuple(entry.model for entry in decode_model_fallbacks(value) or ())
+                    if key == "MODEL_FALLBACKS"
+                    else (value,)
                 )
-                if any(
-                    ref.strip().startswith(provider_id + "/")
-                    for ref in snapshot.process.get(key, target.get(key, "")).split(",")
-                )
-            ]
+                if any(ref.strip().startswith(provider_id + "/") for ref in refs):
+                    references.append(key)
             if references:
                 raise ValueError(
                     "Change these Model Config settings before removing the provider: "
@@ -74,10 +77,8 @@ def merge_custom_provider(
     if "provider_id" in mutation.values:
         raise ValueError("Provider IDs cannot be edited")
     changes = dict(mutation.values)
-    if changes.get("api_key") == "********" or (
-        isinstance(changes.get("api_key"), str) and not str(changes["api_key"]).strip()
-    ):
-        changes.pop("api_key")
+    if "api_key" in changes:
+        raise ValueError("Use the ordered api_keys editor for credentials")
     try:
         definition = CustomProviderDefinition.model_validate(
             values | changes | {"provider_id": provider_id}

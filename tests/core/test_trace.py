@@ -99,6 +99,62 @@ def test_sanitize_masks_nested_api_key_strings() -> None:
     assert out["outer"]["text"] == "visible"
 
 
+def test_trace_redacts_credential_lists_and_all_catalog_aliases():
+    from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
+    from free_claude_code.core.trace import sanitize_trace_value
+
+    owners = {
+        name
+        for descriptor in PROVIDER_CATALOG.values()
+        for name in (descriptor.credential_env, descriptor.credential_attr)
+        if name
+    }
+    values = {
+        name: ["trace-first-sentinel", "trace-inactive-sentinel"] for name in owners
+    }
+    payload = {
+        "values": values,
+        "custom_provider": {
+            "values": {
+                "api_keys": {"entries": [{"value": "custom-trace-sentinel"}]},
+                "display_name": "Visible",
+            }
+        },
+    }
+    public = sanitize_trace_value(payload)
+    encoded = json.dumps(public)
+    for secret in (
+        "trace-first-sentinel",
+        "trace-inactive-sentinel",
+        "custom-trace-sentinel",
+    ):
+        assert secret not in encoded
+    assert public["custom_provider"]["values"]["display_name"] == "Visible"
+
+
+@pytest.mark.parametrize(
+    "header", ["x-goog-api-key", "X-Goog-Api-Key", "api-key", "Api-Key"]
+)
+def test_trace_redacts_provider_api_keys_in_json(tmp_path: Path, header: str) -> None:
+    log_file = str(tmp_path / "credentials.log")
+    configure_logging(log_file, force=True, level="DEBUG")
+    headers = {header: "dummy-provider-secret", "content-type": "application/json"}
+
+    trace_event(
+        stage="ingress",
+        event="request.received",
+        source="unit",
+        requests=[{"headers": headers}],
+    )
+
+    payload = _trace_payloads(log_file)[0]
+    assert payload["requests"] == [
+        {"headers": {header: "<redacted>", "content-type": "application/json"}}
+    ]
+    assert "dummy-provider-secret" not in Path(log_file).read_text(encoding="utf-8")
+    assert headers[header] == "dummy-provider-secret"
+
+
 @pytest.mark.asyncio
 async def test_traced_async_stream_logs_completion(tmp_path) -> None:
     log_file = str(tmp_path / "complete.log")

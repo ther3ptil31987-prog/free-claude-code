@@ -8,9 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 from openai import AsyncOpenAI
 
+from free_claude_code.config.model_refs import ModelFallback
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
-from free_claude_code.providers.stream_recovery import RecoveryHoldbackBuffer
 from tests.api.support import create_test_app, provider_manager_for_app
 from tests.api.test_delivered_stream_recovery import (
     assert_completed,
@@ -20,18 +20,11 @@ from tests.api.test_delivered_stream_recovery import (
 from tests.api.test_hidden_stream_retries import delivered
 from tests.api.test_midstream_model_fallback import delivered_candidates
 from tests.api.test_tool_call_buffer_transports import _tools
+from tests.providers.support import without_empty_reasoning
 from tests.providers.test_anthropic_messages_transport import Wire, _sse
 from tests.providers.test_anthropic_provider import native_body, provider
 from tests.providers.test_history_transports import _harness
 from tests.providers.test_native_tool_arguments import tool_events
-
-
-@pytest.fixture(autouse=True)
-def release_events(monkeypatch):
-    monkeypatch.setattr(
-        "free_claude_code.providers.stream_recovery.RecoveryHoldbackBuffer",
-        lambda: RecoveryHoldbackBuffer(max_bytes=1),
-    )
 
 
 def test_native_fallback_closes_source_preserves_options_and_filters_candidates():
@@ -62,7 +55,10 @@ def test_native_fallback_closes_source_preserves_options_and_filters_candidates(
     app = create_test_app(
         Settings(
             MODEL="anthropic/primary",
-            MODEL_FALLBACKS=["nvidia_nim/excluded", "anthropic/backup"],
+            MODEL_FALLBACKS=[
+                ModelFallback(model="nvidia_nim/excluded"),
+                ModelFallback(model="anthropic/backup"),
+            ],
         ),
         providers={"anthropic": provider(reply, max_attempts=1)},
     )
@@ -71,8 +67,11 @@ def test_native_fallback_closes_source_preserves_options_and_filters_candidates(
         response = client.post("/v1/messages", json=request)
     assert response.status_code == 200
     assert [body["model"] for body in bodies] == ["primary", "backup"]
-    assert bodies[1]["messages"][:-2] == request["messages"]
-    assert bodies[1]["messages"][-2] == {"role": "assistant", "content": "Hello "}
+    assert without_empty_reasoning(bodies[1]["messages"][:-2]) == request["messages"]
+    assert without_empty_reasoning(bodies[1]["messages"][-2]) == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Hello "}],
+    }
     for key in ("tools", "thinking", "max_tokens", "future_option"):
         assert bodies[1][key] == request[key]
     assert all(wire.closed for wire in wires)

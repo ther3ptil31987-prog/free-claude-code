@@ -9,11 +9,17 @@ INFO log level excludes these detailed request traces.
 import asyncio
 import sys
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
-from typing import Any
+from typing import Any, Protocol
 
 from loguru import logger
 
 from free_claude_code.core.async_iterators import try_close_async_iterator
+
+
+class _FramedOutput(Protocol):
+    @property
+    def frames(self) -> tuple[str, ...]: ...
+
 
 TRACE_PAYLOAD_BINDING = "trace_payload"
 
@@ -22,14 +28,18 @@ _SECRET_VALUE_KEYS = frozenset(
     for k in (
         "authorization",
         "x-api-key",
+        "x-goog-api-key",
+        "api-key",
         "anthropic-auth-token",
         "api_key",
+        "api_keys",
         "password",
         "secret",
         "token",
         "bearer_token",
         "openapi_token",
         "nvidia-api-key",
+        "aws_bearer_token_bedrock",
     )
 )
 
@@ -39,7 +49,17 @@ def sanitize_trace_value(obj: Any) -> Any:
     if isinstance(obj, Mapping):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if str(k).lower() in _SECRET_VALUE_KEYS:
+            name = str(k).lower()
+            if name in _SECRET_VALUE_KEYS or name.replace("-", "_").endswith(
+                (
+                    "_api_key",
+                    "_api_keys",
+                    "_api_token",
+                    "_api_tokens",
+                    "_secret_key",
+                    "_secret_keys",
+                )
+            ):
                 out[str(k)] = "<redacted>"
             else:
                 out[str(k)] = sanitize_trace_value(v)
@@ -112,8 +132,8 @@ def extract_claude_session_id_from_headers(headers: Mapping[str, str]) -> str | 
     return None
 
 
-async def traced_async_stream(
-    agen: AsyncIterator[str],
+async def traced_async_stream[T: str | _FramedOutput](
+    agen: AsyncIterator[T],
     *,
     stage: str,
     source: str,
@@ -122,7 +142,7 @@ async def traced_async_stream(
     chunk_event: str | None = None,
     chunk_interval: int = 250,
     extra: Mapping[str, Any] | None = None,
-) -> AsyncGenerator[str]:
+) -> AsyncGenerator[T]:
     """Emit TRACE rows when a text stream completes, fails, cancels, or periodically."""
     common = dict(extra or {})
     count = 0
@@ -131,7 +151,10 @@ async def traced_async_stream(
     try:
         async for chunk in agen:
             count += 1
-            nbytes += len(chunk.encode("utf-8", errors="replace"))
+            nbytes += sum(
+                len(frame.encode("utf-8", errors="replace"))
+                for frame in ((chunk,) if isinstance(chunk, str) else chunk.frames)
+            )
             if chunk_event and chunk_interval > 0 and count % chunk_interval == 0:
                 trace_event(
                     stage=stage,

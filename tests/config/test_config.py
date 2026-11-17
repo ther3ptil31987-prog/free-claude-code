@@ -1,18 +1,17 @@
 """Contracts for pure Settings and canonical source composition."""
 
+import json
 from enum import Enum
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from free_claude_code.application.routing import ModelRouter
 from free_claude_code.config import loader
 from free_claude_code.config.constants import (
-    ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MODEL,
-    HTTP_CONNECT_TIMEOUT_DEFAULT,
 )
 from free_claude_code.config.env_files import dotenv_values_from_file
 from free_claude_code.config.loader import (
@@ -23,11 +22,12 @@ from free_claude_code.config.loader import (
     get_settings,
 )
 from free_claude_code.config.model_refs import (
+    ModelFallback,
     configured_chat_model_refs,
+    normalize_retired_model_settings,
     parse_model_name,
     parse_provider_type,
 )
-from free_claude_code.config.nim import NimSettings
 from free_claude_code.config.paths import (
     managed_env_path,
     messaging_state_dir_path,
@@ -35,6 +35,177 @@ from free_claude_code.config.paths import (
 )
 from free_claude_code.config.reasoning import ReasoningPreference
 from free_claude_code.config.settings import Settings
+
+_SUPER_REF = "nvidia_nim/nvidia/nemotron-3-super-120b-a12b"
+_ULTRA_REF = "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
+
+
+def test_default_claude_aliases_use_hosted_ultra():
+    settings = compose_settings_snapshot({}, {}).settings
+    router = ModelRouter(settings)
+    for tier in ("fable", "opus", "sonnet", "haiku"):
+        assert (
+            router.resolve(f"claude-{tier}-test").primary.provider_model_ref
+            == _ULTRA_REF
+        )
+
+
+@pytest.mark.parametrize("source", [ConfigSource.MANAGED, ConfigSource.PROCESS])
+@pytest.mark.parametrize(
+    "key", ["MODEL", "MODEL_FABLE", "MODEL_OPUS", "MODEL_SONNET", "MODEL_HAIKU"]
+)
+def test_super_migration_preserves_explicit_selection_and_source(source, key):
+    values = {
+        key: f" {_SUPER_REF} ",
+        "REASONING_POLICY": "high",
+        "REASONING_OPUS": "off",
+    }
+    managed = {"MODEL": "groq/default", key: "groq/managed"}
+    process = {}
+    if source is ConfigSource.MANAGED:
+        managed.update(values)
+    else:
+        process.update(values)
+    before = managed.copy(), process.copy()
+    snapshot = compose_settings_snapshot(managed, process)
+    assert getattr(snapshot.settings, key.lower()) == _ULTRA_REF
+    assert snapshot.sources[key.lower()] is source
+    assert snapshot.settings.reasoning_policy is ReasoningPreference.HIGH
+    assert snapshot.settings.reasoning_opus is ReasoningPreference.OFF
+    if key != "MODEL":
+        assert snapshot.settings.model == "groq/default"
+    assert (managed, process) == before
+
+
+@pytest.mark.parametrize("source", [ConfigSource.MANAGED, ConfigSource.PROCESS])
+@pytest.mark.parametrize("super_first", [True, False])
+def test_super_fallback_migration_preserves_order_reasoning_and_distinct_keys(
+    source, super_first
+):
+    first, second = (
+        (_SUPER_REF, _ULTRA_REF) if super_first else (_ULTRA_REF, _SUPER_REF)
+    )
+    values = {
+        "MODEL": _SUPER_REF,
+        "NVIDIA_NIM_API_KEY": '["key-one", "key-two"]',
+        "MODEL_FALLBACKS": json.dumps(
+            [
+                {"model": first, "reasoning": "low"},
+                {"model": second, "reasoning": "high"},
+                {"model": _SUPER_REF, "reasoning": "off", "api_key_number": 2},
+                {"model": "groq/backup", "reasoning": "medium"},
+            ]
+        ),
+    }
+    snapshot = compose_settings_snapshot(
+        values if source is ConfigSource.MANAGED else {},
+        values if source is ConfigSource.PROCESS else {},
+    )
+    assert snapshot.settings.model_fallbacks == (
+        ModelFallback(model=_ULTRA_REF, reasoning=ReasoningPreference.LOW),
+        ModelFallback(
+            model=_ULTRA_REF, reasoning=ReasoningPreference.OFF, api_key_number=2
+        ),
+        ModelFallback(model="groq/backup", reasoning=ReasoningPreference.MEDIUM),
+    )
+    assert snapshot.sources["model_fallbacks"] is source
+    route = ModelRouter(snapshot.settings).resolve("claude-opus-test")
+    assert [
+        (entry.target.provider_model_ref, entry.target.api_key_number)
+        for entry in route.fallbacks
+    ] == [
+        (_ULTRA_REF, 2),
+        ("groq/backup", 1),
+    ]
+
+
+@pytest.mark.parametrize(
+    "refs",
+    [
+        [_SUPER_REF, _SUPER_REF, _ULTRA_REF],
+        [_SUPER_REF, _ULTRA_REF, _ULTRA_REF],
+        [_SUPER_REF, "groq/backup", "groq/backup"],
+    ],
+)
+def test_super_migration_does_not_hide_preexisting_fallback_duplicates(refs):
+    with pytest.raises(ValidationError, match="duplicate model/key pairs"):
+        compose_settings_snapshot({"MODEL_FALLBACKS": json.dumps(refs)}, {})
+
+
+@pytest.mark.parametrize(
+    "fallbacks",
+    [
+        f"{_SUPER_REF},",
+        "[invalid",
+        '[{"model":"groq/a","api_key_number":0}]',
+        '[{"model":"groq/a","reasoning":"invalid"}]',
+    ],
+)
+def test_super_migration_keeps_invalid_settings_invalid(fallbacks):
+    with pytest.raises(ValidationError):
+        compose_settings_snapshot(
+            {"MODEL": _SUPER_REF, "MODEL_FALLBACKS": fallbacks}, {}
+        )
+
+
+def test_model_repairs_leave_unaffected_fallback_text_unchanged():
+    values = {
+        "MODEL_FALLBACKS": '[{"model":"groq/backup","reasoning":"inherit","api_key_number":1}]',
+        "UNKNOWN": "keep",
+    }
+    assert (
+        normalize_retired_model_settings(values, preserve_empty_overrides=False)
+        == values
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "open_router/nvidia/nemotron-3-super-120b-a12b",
+        "custom_00000000000000000000000000000000/nvidia/nemotron-3-super-120b-a12b",
+        _SUPER_REF + "-successor",
+    ],
+)
+def test_super_migration_leaves_other_endpoints_unchanged(model):
+    values = {
+        "MODEL": model,
+        "MODEL_OPUS": model,
+        "MODEL_FALLBACKS": json.dumps(
+            [{"model": model, "reasoning": "inherit", "api_key_number": 1}],
+            separators=(",", ":"),
+        ),
+    }
+    assert (
+        normalize_retired_model_settings(values, preserve_empty_overrides=False)
+        == values
+    )
+
+
+def test_builtin_effort_is_from_client_with_inherited_tier_efforts():
+    snapshot = compose_settings_snapshot({}, {})
+    settings = snapshot.settings
+    assert settings.reasoning_policy is ReasoningPreference.CLIENT
+    assert snapshot.sources["reasoning_policy"] is ConfigSource.DEFAULT
+    router = ModelRouter(settings)
+    for tier in ("fable", "opus", "sonnet", "haiku"):
+        assert getattr(settings, f"model_{tier}") is None
+        assert getattr(settings, f"reasoning_{tier}") is ReasoningPreference.INHERIT
+        route = router.resolve(f"claude-{tier}-test")
+        assert route.primary.provider_model_ref == settings.model
+        assert route.reasoning_preference is ReasoningPreference.CLIENT
+
+
+@pytest.mark.parametrize("source", [ConfigSource.MANAGED, ConfigSource.PROCESS])
+@pytest.mark.parametrize("effort", ["client", "off", "medium", "high"])
+def test_explicit_default_effort_is_retained(source, effort):
+    values = {"REASONING_POLICY": effort}
+    snapshot = compose_settings_snapshot(
+        values if source is ConfigSource.MANAGED else {},
+        values if source is ConfigSource.PROCESS else {},
+    )
+    assert snapshot.settings.reasoning_policy is ReasoningPreference(effort)
+    assert snapshot.sources["reasoning_policy"] is source
 
 
 @pytest.mark.parametrize("source", [ConfigSource.MANAGED, ConfigSource.PROCESS])
@@ -87,7 +258,10 @@ def test_retirement_preserves_effective_default_order_and_process_environment(
     assert snapshot.settings.model == "groq/default"
     assert snapshot.settings.model_opus is None
     assert snapshot.sources["model_opus"] is ConfigSource.PROCESS
-    assert snapshot.settings.model_fallbacks == ("groq/first", "deepseek/last")
+    assert snapshot.settings.model_fallbacks == (
+        ModelFallback(model="groq/first"),
+        ModelFallback(model="deepseek/last"),
+    )
     assert loader.os.environ["MODEL_OPUS"] == "github_models/opus"
 
 
@@ -114,16 +288,31 @@ def test_direct_settings_still_reject_retired_provider():
         Settings(MODEL="github_models/openai/old")
 
 
+@pytest.mark.parametrize("value", ["0.01", "0", "invalid"])
+@pytest.mark.parametrize("source", ["managed", "process"])
+def test_retired_progress_timeout_is_ignored(value, source):
+    managed = {"HTTP_READ_TIMEOUT": "120"}
+    process = {"HTTP_CONNECT_TIMEOUT": "30"}
+    (managed if source == "managed" else process)["PROVIDER_PROGRESS_TIMEOUT"] = value
+    snapshot = compose_settings_snapshot(managed, process)
+
+    assert "provider_progress_timeout" not in snapshot.settings.model_dump()
+    assert snapshot.settings.http_read_timeout == 120
+    assert snapshot.settings.http_connect_timeout == 30
+    assert snapshot.sources["http_read_timeout"] is ConfigSource.MANAGED
+    assert snapshot.sources["http_connect_timeout"] is ConfigSource.PROCESS
+
+
 def test_settings_defaults_are_valid_and_nonempty() -> None:
     settings = Settings()
 
     assert settings.provider_rate_limit == 1
     assert settings.provider_rate_window == 2
     assert settings.provider_max_concurrency == 2
-    assert settings.provider_progress_timeout == 600.0
+    assert settings.provider_max_attempts == 5
     assert settings.http_read_timeout == 120.0
-    assert settings.http_write_timeout == 10.0
-    assert settings.http_connect_timeout == HTTP_CONNECT_TIMEOUT_DEFAULT
+    assert settings.http_write_timeout == 30.0
+    assert settings.http_connect_timeout == 30.0
     assert settings.voice_note_enabled is True
     assert settings.whisper_device == "cpu"
     assert settings.whisper_model == "base"
@@ -141,14 +330,9 @@ def test_settings_defaults_are_valid_and_nonempty() -> None:
 
 
 def test_every_external_setting_has_one_explicit_alias() -> None:
-    aliases = [
-        field.validation_alias
-        for name, field in Settings.model_fields.items()
-        if name != "nim"
-    ]
+    aliases = [field.validation_alias for field in Settings.model_fields.values()]
     assert all(isinstance(alias, str) for alias in aliases)
     assert len(aliases) == len(set(aliases))
-    assert Settings.model_fields["nim"].validation_alias is None
 
 
 def test_direct_settings_construction_performs_no_environment_io(
@@ -168,16 +352,10 @@ def test_direct_settings_construction_performs_no_environment_io(
     [
         ("MODEL", "model", "deepseek/deepseek-chat", "deepseek/deepseek-chat"),
         ("PROVIDER_RATE_LIMIT", "provider_rate_limit", "20", 20),
-        (
-            "PROVIDER_PROGRESS_TIMEOUT",
-            "provider_progress_timeout",
-            "900",
-            900.0,
-        ),
         ("HTTP_READ_TIMEOUT", "http_read_timeout", "600", 600.0),
         ("FCC_OPEN_BROWSER", "open_admin_browser", "false", False),
         ("REASONING_POLICY", "reasoning_policy", "off", ReasoningPreference.OFF),
-        ("GROQ_API_KEY", "groq_api_key", " secret ", "secret"),
+        ("GROQ_API_KEY", "groq_api_keys", " secret ", (SecretStr("secret"),)),
         ("OPENROUTER_PROXY", "open_router_proxy", " http://proxy ", "http://proxy"),
     ],
 )
@@ -191,31 +369,6 @@ def test_process_values_are_parsed_at_the_loader_boundary(
 
     assert getattr(snapshot.settings, attribute) == expected
     assert snapshot.sources[attribute] is ConfigSource.PROCESS
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        0.0,
-        -1.0,
-        float("inf"),
-        float("-inf"),
-        float("nan"),
-        float(1 << 64),
-    ],
-)
-def test_provider_progress_timeout_must_be_representable(value: float) -> None:
-    with pytest.raises(ValidationError):
-        Settings(provider_progress_timeout=value)
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["0", "-1", "inf", "-inf", "nan", str(1 << 64)],
-)
-def test_loader_rejects_invalid_provider_progress_timeout(value: str) -> None:
-    with pytest.raises(ValidationError):
-        compose_settings_snapshot({}, {"PROVIDER_PROGRESS_TIMEOUT": value})
 
 
 @pytest.mark.parametrize(
@@ -236,7 +389,9 @@ def test_optional_blank_process_values_normalize_to_none(key: str) -> None:
         if field.validation_alias == key
     )
 
-    assert getattr(snapshot.settings, attribute) is None
+    assert getattr(snapshot.settings, attribute) == (
+        () if key == "GROQ_API_KEY" else None
+    )
 
 
 def test_blank_required_process_value_is_rejected() -> None:
@@ -303,7 +458,7 @@ def test_repair_invalid_managed_provider_proxies_removes_all_eligible_values() -
     managed = _write_managed_config(
         "\n".join(
             (
-                "FCC_CONFIG_SCHEMA=1",
+                "FCC_CONFIG_SCHEMA=2",
                 "MODEL=nvidia_nim/test-model",
                 "OPENROUTER_PROXY=http://proxy.example:notaport",
                 "GROQ_PROXY=https://proxy.example:8443",
@@ -329,7 +484,7 @@ def test_repair_invalid_managed_provider_proxies_removes_all_eligible_values() -
 def test_repair_valid_managed_provider_proxy_leaves_file_unchanged() -> None:
     managed = _write_managed_config(
         "# Keep this exact text on a no-op.\n"
-        "FCC_CONFIG_SCHEMA=1\n"
+        "FCC_CONFIG_SCHEMA=2\n"
         "OPENAI_PROXY=https://proxy.example:8443\n"
     )
     baseline = managed.read_bytes()
@@ -351,7 +506,7 @@ def test_repair_preserves_process_owned_managed_proxy(
 ) -> None:
     invalid_openai = "invalid://managed-proxy"
     managed = _write_managed_config(
-        "FCC_CONFIG_SCHEMA=1\n"
+        "FCC_CONFIG_SCHEMA=2\n"
         f"OPENAI_PROXY={invalid_openai}\n"
         "OPENROUTER_PROXY=invalid://unshadowed\n"
     )
@@ -370,7 +525,7 @@ def test_repair_preserves_process_owned_managed_proxy(
 
 def test_repair_propagates_atomic_write_failure_without_changing_source() -> None:
     managed = _write_managed_config(
-        "FCC_CONFIG_SCHEMA=1\nOPENAI_PROXY=invalid://managed-proxy\n"
+        "FCC_CONFIG_SCHEMA=2\nOPENAI_PROXY=invalid://managed-proxy\n"
     )
     baseline = managed.read_bytes()
 
@@ -389,7 +544,7 @@ def test_repair_propagates_atomic_write_failure_without_changing_source() -> Non
 
 def test_repair_is_idempotent_and_writes_only_once() -> None:
     managed = _write_managed_config(
-        "FCC_CONFIG_SCHEMA=1\nOPENAI_PROXY=invalid://managed-proxy\n"
+        "FCC_CONFIG_SCHEMA=2\nOPENAI_PROXY=invalid://managed-proxy\n"
     )
 
     with patch.object(
@@ -408,7 +563,7 @@ def test_repair_is_idempotent_and_writes_only_once() -> None:
 
 
 def test_repair_propagates_malformed_managed_config() -> None:
-    managed = _write_managed_config('FCC_CONFIG_SCHEMA=1\nOPENAI_PROXY="unterminated\n')
+    managed = _write_managed_config('FCC_CONFIG_SCHEMA=2\nOPENAI_PROXY="unterminated\n')
     baseline = managed.read_bytes()
 
     with pytest.raises(ValueError, match="Could not parse configuration file"):
@@ -421,7 +576,7 @@ def test_repair_propagates_config_lock_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     managed = _write_managed_config(
-        "FCC_CONFIG_SCHEMA=1\nOPENAI_PROXY=invalid://managed-proxy\n"
+        "FCC_CONFIG_SCHEMA=2\nOPENAI_PROXY=invalid://managed-proxy\n"
     )
     baseline = managed.read_bytes()
 
@@ -452,7 +607,7 @@ def test_optional_strings_share_one_normalization_rule() -> None:
         }
     )
 
-    assert settings.groq_api_key == "key"
+    assert settings.groq_api_keys == (SecretStr("key"),)
     assert settings.open_router_proxy is None
     assert settings.model_opus is None
     assert settings.allowed_dir is None
@@ -477,8 +632,8 @@ def test_model_fallbacks_preserve_order_and_trim_members(value: object) -> None:
     settings = Settings.model_validate({"MODEL_FALLBACKS": value})
 
     assert settings.model_fallbacks == (
-        "open_router/vendor/model-a",
-        "groq/vendor/model-b",
+        ModelFallback(model="open_router/vendor/model-a"),
+        ModelFallback(model="groq/vendor/model-b"),
     )
 
 
@@ -533,9 +688,9 @@ def test_configured_chat_model_refs_are_unique() -> None:
         model_fable="open_router/anthropic/claude-fable",
         model_sonnet="deepseek/fallback",
         model_fallbacks=(
-            "groq/vendor/model-a",
-            "open_router/anthropic/claude-fable",
-            "lmstudio/vendor/model-b",
+            ModelFallback(model="groq/vendor/model-a"),
+            ModelFallback(model="open_router/anthropic/claude-fable"),
+            ModelFallback(model="lmstudio/vendor/model-b"),
         ),
     )
 
@@ -571,25 +726,30 @@ def test_paths_are_owned_by_fcc_home(monkeypatch: pytest.MonkeyPatch, tmp_path) 
     assert server_log_path() == tmp_path / ".fcc" / "logs" / "server.log"
 
 
-def test_nim_settings_keep_request_local_validation() -> None:
-    settings = NimSettings.model_validate(
-        {
-            "max_tokens": "1024",
-            "temperature": "0.5",
-            "seed": "7",
-            "stop": "",
-        }
+@pytest.mark.parametrize("operation", ("assign", "delete"))
+def test_settings_reject_normal_mutation(operation: str) -> None:
+    settings = Settings()
+    original = settings.model
+
+    with pytest.raises(ValidationError, match="frozen_instance"):
+        if operation == "assign":
+            settings.__setattr__("model", "nvidia_nim/changed")
+        else:
+            delattr(settings, "model")
+
+    assert settings.model == original
+
+
+def test_settings_validated_replacement_preserves_original() -> None:
+    original = Settings()
+    replacement = Settings.model_validate(
+        original.model_dump() | {"model": "nvidia_nim/changed"}
     )
 
-    assert settings.max_tokens == 1024
-    assert settings.temperature == 0.5
-    assert settings.seed == 7
-    assert settings.stop is None
-    assert NimSettings().max_tokens == ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
-    assert NimSettings().top_p == 0.95
-    for unsupported_top_p in (0.0, 0.9, 1.0):
-        with pytest.raises(ValidationError):
-            NimSettings(top_p=unsupported_top_p)
+    assert replacement.model == "nvidia_nim/changed"
+    assert original.model == DEFAULT_MODEL
+    with pytest.raises(ValidationError):
+        Settings.model_validate(original.model_dump() | {"model": "unknown/model"})
 
 
 def test_settings_defaults_do_not_contain_empty_enum_strings() -> None:

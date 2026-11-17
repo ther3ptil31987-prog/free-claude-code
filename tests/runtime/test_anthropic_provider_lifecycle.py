@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from free_claude_code.config.api_keys import normalize_api_keys
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.config.settings import Settings
 from free_claude_code.providers.anthropic import AnthropicProvider
@@ -18,7 +19,7 @@ async def test_workspace_replacement_retires_http_and_capabilities_with_lease():
     owners = []
     requests = []
 
-    def factory(settings, registry):
+    def factory(settings, registry, history_cache=None):
         def handle(request):
             requests.append(request)
             if settings.anthropic_workspace_id == "new":
@@ -37,14 +38,14 @@ async def test_workspace_replacement_retires_http_and_capabilities_with_lease():
             transport=httpx.MockTransport(handle),
         )
         owners.append(owner)
-        return ProviderRuntime(settings, registry, {"anthropic": owner})
+        return ProviderRuntime(settings, registry, None, {("anthropic", 1): owner})
 
     async def commit():
         return None
 
     settings = Settings(
         MODEL="anthropic/same-model",
-        NVIDIA_NIM_API_KEY=None,
+        NVIDIA_NIM_API_KEY=(),
         ANTHROPIC_API_KEY="old-key",
         ANTHROPIC_WORKSPACE_ID="old",
     )
@@ -57,7 +58,10 @@ async def test_workspace_replacement_retires_http_and_capabilities_with_lease():
         record = await old.model_record("same-model")
         await manager.replace(
             settings.model_copy(
-                update={"anthropic_api_key": "new-key", "anthropic_workspace_id": "new"}
+                update={
+                    "anthropic_api_keys": normalize_api_keys("new-key"),
+                    "anthropic_workspace_id": "new",
+                }
             ),
             commit=commit,
         )
@@ -69,8 +73,8 @@ async def test_workspace_replacement_retires_http_and_capabilities_with_lease():
         assert new_lease.model_info("anthropic", "same-model") is not None
         assert (await new.model_record("same-model")).messages.adaptive_thinking is None
         assert await old.model_record("same-model") is record
-        assert (await old.endpoint()).headers["anthropic-workspace-id"] == "old"
-        assert (await new.endpoint()).headers["Authorization"] == "Bearer new-key"
+        assert old._snapshot.headers["anthropic-workspace-id"] == "old"
+        assert new._snapshot.headers["Authorization"] == "Bearer new-key"
         assert not old._http.is_closed
         await old_lease.release()
         assert old._http.is_closed

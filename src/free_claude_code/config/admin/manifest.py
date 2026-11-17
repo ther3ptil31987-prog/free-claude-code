@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.config.reasoning import (
+    FALLBACK_REASONING_PREFERENCES,
     ROOT_REASONING_PREFERENCES,
     ROUTE_REASONING_PREFERENCES,
     ReasoningPreference,
@@ -42,12 +43,7 @@ SECTIONS: tuple[ConfigSectionSpec, ...] = (
     ConfigSectionSpec(
         "models",
         "Model Routing",
-        "Search discovered provider models or enter a provider/model slug.",
-    ),
-    ConfigSectionSpec(
-        "reasoning",
-        "Reasoning",
-        "Client reasoning policy and route-specific overrides.",
+        "Choose a model and effort together. Tier overrides can inherit the defaults.",
     ),
     ConfigSectionSpec(
         "runtime",
@@ -131,6 +127,7 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
         "models",
         "model_list",
         settings_attr="model_fallbacks",
+        options=_reasoning_options(FALLBACK_REASONING_PREFERENCES),
         description=(
             "Tried in order when the selected provider/model fails before output "
             "starts. Applies to every client. One request may reach multiple "
@@ -140,45 +137,45 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
     ),
     ConfigFieldSpec(
         "REASONING_POLICY",
-        "Reasoning Policy",
-        "reasoning",
+        "Default Effort",
+        "models",
         "select",
         settings_attr="reasoning_policy",
         options=_reasoning_options(ROOT_REASONING_PREFERENCES),
         description=(
-            "From client preserves CLI effort. Providers translate only the controls "
-            "their API supports. Native Anthropic Messages requests always use the "
-            "client thinking controls."
+            "Used by inherited routes and direct provider/model requests. From client "
+            "preserves CLI effort. Native Anthropic primary requests use client "
+            "thinking controls."
         ),
     ),
     ConfigFieldSpec(
         "REASONING_FABLE",
-        "Fable Reasoning",
-        "reasoning",
+        "Fable Effort",
+        "models",
         "select",
         settings_attr="reasoning_fable",
         options=_reasoning_options(ROUTE_REASONING_PREFERENCES),
     ),
     ConfigFieldSpec(
         "REASONING_OPUS",
-        "Opus Reasoning",
-        "reasoning",
+        "Opus Effort",
+        "models",
         "select",
         settings_attr="reasoning_opus",
         options=_reasoning_options(ROUTE_REASONING_PREFERENCES),
     ),
     ConfigFieldSpec(
         "REASONING_SONNET",
-        "Sonnet Reasoning",
-        "reasoning",
+        "Sonnet Effort",
+        "models",
         "select",
         settings_attr="reasoning_sonnet",
         options=_reasoning_options(ROUTE_REASONING_PREFERENCES),
     ),
     ConfigFieldSpec(
         "REASONING_HAIKU",
-        "Haiku Reasoning",
-        "reasoning",
+        "Haiku Effort",
+        "models",
         "select",
         settings_attr="reasoning_haiku",
         options=_reasoning_options(ROUTE_REASONING_PREFERENCES),
@@ -227,17 +224,15 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
         settings_attr="provider_max_concurrency",
     ),
     ConfigFieldSpec(
-        "PROVIDER_PROGRESS_TIMEOUT",
-        "Provider Progress Timeout",
+        "PROVIDER_MAX_ATTEMPTS",
+        "Provider Max Attempts",
         "runtime",
         "number",
-        settings_attr="provider_progress_timeout",
+        settings_attr="provider_max_attempts",
         description=(
-            "Maximum seconds without a non-empty protocol event, including "
-            "provider admission, retries, and backoff. Independent of HTTP Read "
-            "Timeout."
+            "Total tries per model for one request, including the first. Retries, "
+            "mid-stream continuations, and model discovery all count against it."
         ),
-        advanced=True,
     ),
     ConfigFieldSpec(
         "HTTP_READ_TIMEOUT",
@@ -389,46 +384,6 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
         "voice",
         settings_attr="whisper_model",
         session_sensitive=True,
-    ),
-    ConfigFieldSpec(
-        "FAST_PREFIX_DETECTION",
-        "Fast Prefix Detection",
-        "runtime",
-        "boolean",
-        settings_attr="fast_prefix_detection",
-        advanced=True,
-    ),
-    ConfigFieldSpec(
-        "ENABLE_NETWORK_PROBE_MOCK",
-        "Network Probe Mock",
-        "runtime",
-        "boolean",
-        settings_attr="enable_network_probe_mock",
-        advanced=True,
-    ),
-    ConfigFieldSpec(
-        "ENABLE_TITLE_GENERATION_SKIP",
-        "Title Generation Skip",
-        "runtime",
-        "boolean",
-        settings_attr="enable_title_generation_skip",
-        advanced=True,
-    ),
-    ConfigFieldSpec(
-        "ENABLE_SUGGESTION_MODE_SKIP",
-        "Suggestion Mode Skip",
-        "runtime",
-        "boolean",
-        settings_attr="enable_suggestion_mode_skip",
-        advanced=True,
-    ),
-    ConfigFieldSpec(
-        "ENABLE_FILEPATH_EXTRACTION_MOCK",
-        "Filepath Extraction Mock",
-        "runtime",
-        "boolean",
-        settings_attr="enable_filepath_extraction_mock",
-        advanced=True,
     ),
     ConfigFieldSpec(
         "ENABLE_WEB_SERVER_TOOLS",

@@ -358,26 +358,13 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
         (
             "test_provider_interleaved_thinking_tool_e2e",
             "test_provider_tool_result_continuation_e2e",
-            "test_provider_interrupted_tool_turn_resume_e2e",
+            "test_provider_tool_history_resume_e2e",
             "test_gemini_thought_signature_tool_continuation_e2e",
             "test_provider_reasoning_tool_continuation_e2e",
         ),
         ("tools", "providers"),
         ("configured tool-capable provider",),
         "tool-capable configured providers must emit or continue tool results",
-    ),
-    FeatureCoverage(
-        "request_optimization",
-        "Local request optimizations return product responses without providers",
-        (
-            "tests/api/test_optimization_handlers.py",
-            "tests/api/test_routes_optimizations.py",
-        ),
-        ("test_optimization_fast_paths_do_not_need_provider",),
-        ("test_api_request_optimizations_e2e",),
-        ("api",),
-        (),
-        "always runnable once the local smoke server starts",
     ),
     FeatureCoverage(
         "smart_rate_limiting",
@@ -699,7 +686,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
             "tests/api/test_execution_failure_contract.py",
             "tests/core/test_failure_protocol_mapping.py",
             "tests/providers/test_execution_failure_boundary.py",
-            "tests/providers/test_failure_policy.py",
+            "tests/providers/test_failure_reporting.py",
         ),
         (),
         (

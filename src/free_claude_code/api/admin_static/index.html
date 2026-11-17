@@ -117,6 +117,29 @@
             <article class="provider-strip integration-card">
               <div class="section-heading">
                 <div>
+                  <h3>Claude Code onboarding</h3>
+                  <p>Complete Claude Code's first-time setup for this user.</p>
+                </div>
+              </div>
+              <p id="claudeOnboardingMessage" class="message-area" role="status" hidden></p>
+              <button id="openClaudeOnboarding" class="primary-button" type="button" aria-busy="true" disabled>Loading…</button>
+            </article>
+            <dialog id="claudeOnboardingDialog" class="integration-dialog" aria-labelledby="claudeOnboardingTitle" aria-describedby="claudeOnboardingDescription">
+              <div class="section-heading">
+                <h3 id="claudeOnboardingTitle">Claude Code onboarding</h3>
+                <button id="closeClaudeOnboarding" class="ghost-button" type="button" aria-label="Close" autofocus>×</button>
+              </div>
+              <p id="claudeOnboardingDescription">Mark Claude Code onboarding as completed for this user.</p>
+              <div class="integration-files">
+                <strong>Files to modify</strong>
+                <ul id="claudeOnboardingFiles"></ul>
+              </div>
+              <button id="confirmClaudeOnboarding" class="primary-button" type="button">Complete onboarding</button>
+              <p id="claudeOnboardingDialogMessage" class="message-area error" role="alert" hidden></p>
+            </dialog>
+            <article class="provider-strip integration-card">
+              <div class="section-heading">
+                <div>
                   <h3>Codex in VS Code and App</h3>
                   <p>Use FCC's models in the Codex VS Code extension and desktop app.</p>
                 </div>
@@ -236,6 +259,7 @@
       <div id="providerDialogBody">
         <div id="providerDialogActions" class="provider-actions"></div>
         <div id="providerDialogCheck" class="provider-check-result" role="status" hidden></div>
+        <div id="providerDialogAvailability" class="provider-availability-result" role="status" hidden></div>
         <div id="providerFields" class="field-grid"></div>
       </div>
       <div id="providerMessage" class="message-area" role="status"></div>
@@ -246,6 +270,7 @@
     </dialog>
     <script src="/admin/assets/__FCC_VERSION__/form_controls.js"></script>
     <script src="/admin/assets/__FCC_VERSION__/model_combobox.js"></script>
+    <script src="/admin/assets/__FCC_VERSION__/api_key_editor.js"></script>
     <script src="/admin/assets/__FCC_VERSION__/session_ui.js"></script>
     <script src="/admin/assets/__FCC_VERSION__/code_sessions.js"></script>
     <script src="/admin/assets/__FCC_VERSION__/admin.js"></script>

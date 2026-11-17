@@ -1,11 +1,13 @@
 import json
-import math
 
 import pytest
 from fastapi.testclient import TestClient
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.application.routing import ModelRouter
+from free_claude_code.config.api_keys import normalize_api_keys
 from free_claude_code.config.custom_providers import CustomProviderDefinition
+from free_claude_code.config.model_refs import ModelFallback
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.model_capabilities import ModelInputModality
 from tests.api.support import create_test_app, provider_manager_for_app
@@ -17,7 +19,7 @@ def _settings(
     model_fable: str | None = None,
     model_opus: str | None = "open_router/anthropic/claude-opus",
     model_haiku: str | None = "deepseek/deepseek-chat",
-    model_fallbacks: tuple[str, ...] | None = None,
+    model_fallbacks: tuple[ModelFallback, ...] | None = None,
 ) -> Settings:
     return Settings.model_construct(
         model=model,
@@ -28,9 +30,9 @@ def _settings(
         model_fallbacks=model_fallbacks,
         proxy_auth_enabled=False,
         proxy_auth_token="freecc",
-        deepseek_api_key="deepseek-key",
-        open_router_api_key="open-router-key",
-        wafer_api_key="wafer-key",
+        deepseek_api_keys=normalize_api_keys("deepseek-key"),
+        open_router_api_keys=normalize_api_keys("open-router-key"),
+        wafer_api_keys=normalize_api_keys("wafer-key"),
     )
 
 
@@ -39,6 +41,38 @@ def _cache_models(app, provider_id: str, *model_ids: str) -> None:
         provider_id,
         {ProviderModelInfo(model_id) for model_id in model_ids},
     )
+
+
+@pytest.mark.parametrize("view", ["claude", "claude-desktop"])
+@pytest.mark.parametrize("overrides", [False, True])
+def test_claude_shortcuts_are_exactly_four_current_versions_and_route_by_tier(
+    view, overrides
+):
+    expected = {
+        "claude-fable-5-2": "Claude Fable 5.2",
+        "claude-opus-5-5": "Claude Opus 5.5",
+        "claude-sonnet-5-5": "Claude Sonnet 5.5",
+        "claude-haiku-5-5": "Claude Haiku 5.5",
+    }
+    settings = _settings().model_copy(
+        update={
+            f"model_{tier}": f"deepseek/{tier}-target" if overrides else None
+            for tier in ("fable", "opus", "sonnet", "haiku")
+        }
+    )
+    response = TestClient(create_test_app(settings)).get(f"/v1/models?view={view}")
+    assert response.status_code == 200
+    shortcuts = {
+        row["id"]: row["display_name"]
+        for row in response.json()["data"]
+        if "/" not in row["id"]
+    }
+    assert list(shortcuts.items()) == list(expected.items())
+    router = ModelRouter(settings)
+    for model_id in shortcuts:
+        tier = model_id.split("-")[1]
+        target = f"deepseek/{tier}-target" if overrides else settings.model
+        assert router.resolve(model_id).primary.provider_model_ref == target
 
 
 @pytest.mark.parametrize("view", ["messages", "responses"])
@@ -79,7 +113,10 @@ def test_sorted_catalog_retains_an_explicit_no_thinking_server_default(view):
         model="open_router/Zulu",
         model_opus=None,
         model_haiku=None,
-        model_fallbacks=("wafer/z-fallback", "deepseek/a-fallback"),
+        model_fallbacks=(
+            ModelFallback(model="wafer/z-fallback"),
+            ModelFallback(model="deepseek/a-fallback"),
+        ),
     )
     app = create_test_app(settings)
     provider_manager_for_app(app).cache_model_infos(
@@ -99,7 +136,10 @@ def test_sorted_catalog_retains_an_explicit_no_thinking_server_default(view):
     assert payload["default_model_id"] == "claude-3-freecc-no-thinking/open_router/Zulu"
     assert payload["first_id"] == "deepseek/a-fallback"
     assert payload["last_id"] == "wafer/z-fallback"
-    assert settings.model_fallbacks == ("wafer/z-fallback", "deepseek/a-fallback")
+    assert settings.model_fallbacks == (
+        ModelFallback(model="wafer/z-fallback"),
+        ModelFallback(model="deepseek/a-fallback"),
+    )
 
 
 def test_models_list_includes_configured_refs_cached_provider_models_and_aliases():
@@ -117,7 +157,7 @@ def test_models_list_includes_configured_refs_cached_provider_models_and_aliases
     assert response.status_code == 200
     data = response.json()
     ids = [item["id"] for item in data["data"]]
-    assert ids[0] == "claude-fable-5"
+    assert ids[0] == "claude-fable-5-2"
     assert [model_id for model_id in ids if "/" in model_id] == [
         "anthropic/deepseek/deepseek-chat",
         "claude-3-freecc-no-thinking/deepseek/deepseek-chat",
@@ -137,8 +177,8 @@ def test_models_list_includes_configured_refs_cached_provider_models_and_aliases
         display_names["claude-3-freecc-no-thinking/open_router/meta/llama-3.3"]
         == "open_router/meta/llama-3.3 (no thinking)"
     )
-    assert "claude-sonnet-4-20250514" in ids
-    assert "claude-fable-5" in ids
+    assert "claude-sonnet-5-5" in ids
+    assert "claude-fable-5-2" in ids
     assert data["first_id"] == ids[0]
     assert data["last_id"] == ids[-1]
     assert data["has_more"] is False
@@ -250,7 +290,7 @@ def test_models_list_includes_fallback_refs_without_cached_discovery():
         _settings(
             model_opus=None,
             model_haiku=None,
-            model_fallbacks=("wafer/DeepSeek-V4-Pro",),
+            model_fallbacks=(ModelFallback(model="wafer/DeepSeek-V4-Pro"),),
         )
     )
 
@@ -269,14 +309,14 @@ def test_models_list_works_with_empty_discovery_catalog():
 
     assert response.status_code == 200
     ids = [item["id"] for item in response.json()["data"]]
-    assert ids[0] == "claude-fable-5"
+    assert ids[0] == "claude-fable-5-2"
     assert [model_id for model_id in ids if "/" in model_id] == [
         "anthropic/deepseek/deepseek-chat",
         "claude-3-freecc-no-thinking/deepseek/deepseek-chat",
         "anthropic/open_router/anthropic/claude-opus",
         "claude-3-freecc-no-thinking/open_router/anthropic/claude-opus",
     ]
-    assert "claude-sonnet-4-20250514" in ids
+    assert "claude-sonnet-5-5" in ids
 
 
 def test_direct_model_views_exclude_claude_aliases_and_duplicate_variants():
@@ -298,7 +338,7 @@ def test_direct_model_views_exclude_claude_aliases_and_duplicate_variants():
         "claude-3-freecc-no-thinking/open_router/plain-model",
         "open_router/reasoning-model",
     ]
-    assert "claude-sonnet-4-20250514" not in {row["id"] for row in messages["data"]}
+    assert "claude-sonnet-5-5" not in {row["id"] for row in messages["data"]}
     assert all("apiBackend" not in row for row in messages["data"])
     assert responses["data"][0] == {
         "object": "model",
@@ -323,7 +363,7 @@ def test_direct_model_views_exclude_claude_aliases_and_duplicate_variants():
             "xhigh",
             "max",
         ],
-        "inferenceIdleTimeoutSecs": 660,
+        "inferenceIdleTimeoutSecs": 2_147_483,
     }
     plain = responses["data"][1]
     assert plain["supportsReasoningEffort"] is False
@@ -436,7 +476,7 @@ def test_muse_model_catalog_marks_every_routable_model_visible():
         metadata = row["metadata"]["muse-code"]
         assert metadata["is_hidden"] is False
         assert metadata["name"] == row["display_name"]
-        assert metadata["limit"] == {"context": 200000}
+        assert metadata["limit"] == {"context": 200000, "output": 81920}
         original = {key: value for key, value in row.items() if key != "metadata"}
         assert original in responses.json()["data"]
     assert [row["id"] for row in muse.json()["data"]] == [
@@ -479,41 +519,55 @@ def test_muse_catalog_uses_native_metadata_for_known_limits_and_reasoning():
         "name": "open_router/plain-model (no thinking)",
         "is_hidden": False,
         "reasoning": False,
-        "limit": {"context": 65536},
+        "limit": {"context": 65536, "output": 65536},
     }
     assert rows["deepseek/deepseek-chat"] == {
         "name": "deepseek/deepseek-chat",
         "is_hidden": False,
-        "limit": {"context": 200000},
+        "limit": {"context": 200000, "output": 81920},
     }
 
 
-def test_responses_model_view_rounds_timeout_up_before_margin():
-    app = create_test_app(
-        _settings().model_copy(update={"provider_progress_timeout": 1.1})
+@pytest.mark.parametrize(
+    ("context_tokens", "output_tokens", "expected_context", "expected_output"),
+    [
+        (None, None, 200000, 81920),
+        (131072, 8192, 131072, 8192),
+        (65536, None, 65536, 65536),
+        (None, 4096, 200000, 4096),
+        (65536, 49152, 65536, 49152),
+    ],
+)
+def test_muse_limits_are_complete_without_changing_reported_capabilities(
+    context_tokens, output_tokens, expected_context, expected_output
+):
+    from free_claude_code.application.model_catalog import read_model_catalog
+
+    app = create_test_app(_settings(model_opus=None, model_haiku=None))
+    manager = provider_manager_for_app(app)
+    manager.cache_model_infos(
+        "deepseek",
+        {
+            ProviderModelInfo(
+                "deepseek-chat",
+                context_window_tokens=context_tokens,
+                max_output_tokens=output_tokens,
+            )
+        },
     )
+    before = read_model_catalog(manager)
+    client = TestClient(app)
+    response_row = client.get("/v1/models?view=responses").json()["data"][0]
+    muse_row = client.get("/muse-code/models").json()["data"][0]
 
-    response = TestClient(app).get("/v1/models?view=responses")
-
-    assert response.status_code == 200
-    assert {row["inferenceIdleTimeoutSecs"] for row in response.json()["data"]} == {62}
-
-
-def test_responses_model_view_timeout_fits_unsigned_range():
-    largest_accepted_timeout = math.nextafter(float(1 << 64), 0.0)
-    app = create_test_app(
-        _settings().model_copy(
-            update={"provider_progress_timeout": largest_accepted_timeout}
-        )
-    )
-
-    response = TestClient(app).get("/v1/models?view=responses")
-
-    assert response.status_code == 200
-    assert all(
-        row["inferenceIdleTimeoutSecs"] <= (1 << 64) - 1
-        for row in response.json()["data"]
-    )
+    assert muse_row.pop("metadata")["muse-code"]["limit"] == {
+        "context": expected_context,
+        "output": expected_output,
+    }
+    assert muse_row == response_row
+    assert ("maxCompletionTokens" in response_row) is (output_tokens is not None)
+    assert read_model_catalog(manager) == before
+    assert before.models[0].max_output_tokens == output_tokens
 
 
 def test_unknown_model_view_is_rejected():

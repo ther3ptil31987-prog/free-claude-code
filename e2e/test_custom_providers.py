@@ -3,6 +3,8 @@
 import pytest
 from playwright.sync_api import Page, expect
 
+from e2e.provider_support import api_key_input
+
 
 @pytest.fixture(autouse=True)
 def no_page_errors(page: Page):
@@ -17,7 +19,7 @@ def add_provider(page: Page, name: str) -> str:
     dialog = page.locator("#providerDialog")
     dialog.get_by_label("Name", exact=True).fill(name)
     dialog.get_by_label("Base URL", exact=True).fill("https://gateway.example/team/v1")
-    dialog.get_by_label("API key", exact=True).fill("example-custom-key")
+    api_key_input(page, "api_keys").fill("example-custom-key")
     dialog.get_by_label("Model IDs", exact=True).fill("org/model-one\nmodel-two")
     page.locator("#saveProvider").click()
     expect(dialog).not_to_be_visible()
@@ -43,7 +45,7 @@ def test_custom_provider_save_rename_and_remove_preserve_unrelated_draft(
     expect(card.locator(".provider-check-result")).to_have_text("2 models available")
     card.get_by_role("button", name="Edit", exact=True).click()
     dialog = page.locator("#providerDialog")
-    expect(dialog.get_by_label("API key", exact=True)).to_have_value("")
+    expect(api_key_input(page, "api_keys")).to_have_value("")
     dialog.get_by_label("Name", exact=True).fill("Renamed gateway")
     page.locator("#saveProvider").click()
     expect(dialog).not_to_be_visible()
@@ -120,3 +122,28 @@ def test_duplicate_custom_provider_keeps_failed_save_draft(
     )
     expect(page.locator("#saveProvider")).to_be_enabled()
     expect(page.locator("#providers-custom .provider-card")).to_have_count(1)
+
+
+def test_saved_nonchat_format_opens_clean_and_can_switch_to_native_chat_fields(
+    page: Page, admin_base_url: str
+):
+    page.goto(admin_base_url + "/admin")
+    provider_id = add_provider(page, "Protocol gateway")
+    card = page.locator(f'[data-provider="{provider_id}"]')
+    card.get_by_role("button", name="Edit", exact=True).click()
+    dialog = page.locator("#providerDialog")
+    history = dialog.get_by_label("Reasoning history format", exact=True)
+    expect(history.locator("option")).to_have_count(2)
+    dialog.get_by_label("API format", exact=True).select_option("anthropic_messages")
+    page.locator("#saveProvider").click()
+    expect(dialog).not_to_be_visible()
+    card.get_by_role("button", name="Edit", exact=True).click()
+    expect(page.locator("#saveProvider")).to_be_disabled()
+    dialog.get_by_label("API format", exact=True).select_option("openai_chat")
+    expect(history).to_have_value("reasoning_content")
+    history.select_option("reasoning")
+    page.locator("#saveProvider").click()
+    expect(dialog).not_to_be_visible()
+    card.get_by_role("button", name="Edit", exact=True).click()
+    expect(history).to_have_value("reasoning")
+    expect(page.locator("#saveProvider")).to_be_disabled()

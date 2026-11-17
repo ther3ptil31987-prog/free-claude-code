@@ -13,11 +13,15 @@ from free_claude_code.application.connected_accounts import (
 )
 from free_claude_code.application.errors import ApplicationUnavailableError
 from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.config.admin.credentials import CredentialSubmission
 from free_claude_code.config.admin.persistence import PreparedAdminUpdate
+from free_claude_code.config.api_keys import normalize_api_keys
+from free_claude_code.config.loader import ManagedConfigSnapshot
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.messaging.command_context import StopOutcome
 from free_claude_code.messaging.platforms.ports import (
@@ -38,7 +42,9 @@ from tests.providers.support import make_provider_config
 
 
 class TrackingRuntime(ProviderRuntime):
-    def __init__(self, settings: Settings, admission_registry) -> None:
+    def __init__(
+        self, settings: Settings, admission_registry, history_cache=None
+    ) -> None:
         super().__init__(settings, admission_registry)
         self.cleanup_calls = 0
 
@@ -82,9 +88,9 @@ class AdminModelProvider(BaseProvider):
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         continuation: ContinuationSeed | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         if False:
-            yield ""
+            yield StreamOutput(("",))
 
     async def stream_responses(
         self,
@@ -97,9 +103,9 @@ class AdminModelProvider(BaseProvider):
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         continuation: ContinuationSeed | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         if False:
-            yield ""
+            yield StreamOutput(("",))
 
 
 class TrackingFactory:
@@ -108,7 +114,9 @@ class TrackingFactory:
         self.fail = False
         self.events: list[str] = []
 
-    def __call__(self, settings: Settings, admission_registry) -> ProviderRuntime:
+    def __call__(
+        self, settings: Settings, admission_registry, history_cache=None
+    ) -> ProviderRuntime:
         self.events.append(f"construct:{settings.model}")
         if self.fail:
             raise RuntimeError("candidate failed")
@@ -214,6 +222,7 @@ def _prepared(
         errors=(),
         pending_fields=pending_fields,
         path=tmp_path / ".env",
+        expected=ManagedConfigSnapshot(settings, {}, {}, {}, tmp_path / ".env"),
     )
 
 
@@ -232,14 +241,17 @@ def _runtime_with_admin_provider(
     provider: BaseProvider,
 ) -> tuple[ApplicationRuntime, ProviderRuntimeManager]:
     settings = _settings("nvidia_nim/fallback").model_copy(
-        update={"nvidia_nim_api_key": "test-key"}
+        update={"nvidia_nim_api_keys": normalize_api_keys("test-key")}
     )
     manager = ProviderRuntimeManager(
         settings,
-        runtime_factory=lambda snapshot, admission_registry: ProviderRuntime(
-            snapshot,
-            admission_registry,
-            {"nvidia_nim": provider},
+        runtime_factory=lambda snapshot, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                snapshot,
+                admission_registry,
+                None,
+                {("nvidia_nim", 1): provider},
+            )
         ),
     )
     return ApplicationRuntime(
@@ -286,10 +298,7 @@ async def test_provider_check_returns_stable_failure_for_application_error() -> 
     assert result == {
         "provider_id": "nvidia_nim",
         "ok": False,
-        "message": (
-            "Could not refresh this provider's models. "
-            "Verify its configuration and access."
-        ),
+        "message": "The provider is unavailable. Check its configuration and access.",
     }
     assert "error_type" not in result
     await manager.close()
@@ -311,14 +320,12 @@ async def test_provider_check_never_returns_unrecognized_credentials(
     assert result == {
         "provider_id": "nvidia_nim",
         "ok": False,
-        "message": (
-            "Could not refresh this provider's models. "
-            "Verify its configuration and access."
-        ),
+        "message": "Could not load models. Check the provider's settings and retry.",
     }
     log_text = " | ".join(record.getMessage() for record in caplog.records)
     assert "provider=nvidia_nim" in log_text
-    assert "RuntimeError" in log_text
+    assert isinstance(result["message"], str)
+    assert result["message"] in log_text
     assert secret not in log_text
     assert "error_type" not in result
     await manager.close()
@@ -523,6 +530,9 @@ async def test_credential_checks_gate_both_apply_paths(tmp_path, pending, status
     prepared = replace(
         _prepared(_settings("nvidia_nim/new"), tmp_path, pending_fields=pending),
         changed_keys=("GROQ_API_KEY",),
+        credential_submissions=(
+            CredentialSubmission("GROQ_API_KEY", normalize_api_keys("new")),
+        ),
     )
     checks = (
         CredentialCheck("GROQ_API_KEY", status, "Safe result"),
@@ -545,9 +555,14 @@ async def test_credential_checks_gate_both_apply_paths(tmp_path, pending, status
         ) as commit,
     ):
         result = await runtime.apply_admin_config({"GROQ_API_KEY": "new"})
-    check.assert_awaited_once_with(prepared.settings, prepared.changed_keys)
+    check.assert_awaited_once_with(prepared.settings, prepared.credential_submissions)
     assert result["credential_checks"] == [
-        {"key": check.key, "status": check.status.value, "message": check.message}
+        {
+            "key": check.key,
+            "index": check.index,
+            "status": check.status.value,
+            "message": check.message,
+        }
         for check in checks
     ]
     if status == CredentialStatus.REJECTED:

@@ -65,258 +65,6 @@ def test_convert_system_prompt_none():
     assert AnthropicToOpenAIConverter.convert_system_prompt(None) is None
 
 
-def test_openai_build_uses_only_top_level_system_role() -> None:
-    request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "system": "Conversation-wide instructions",
-            "messages": [
-                {"role": "user", "content": "First question"},
-                {"role": "system", "content": "Instructions from this point"},
-                {"role": "system", "content": "A second reminder"},
-                {"role": "assistant", "content": "First answer"},
-                {"role": "user", "content": "Second question"},
-                {"role": "system", "content": "A final reminder"},
-            ],
-        }
-    )
-
-    body = build_base_request_body(request)
-
-    assert body["messages"] == [
-        {"role": "system", "content": "Conversation-wide instructions"},
-        {
-            "role": "user",
-            "content": (
-                "First question\n\nInstructions from this point\n\nA second reminder"
-            ),
-        },
-        {"role": "assistant", "content": "First answer"},
-        {"role": "user", "content": "Second question\n\nA final reminder"},
-    ]
-
-
-def test_openai_build_demotes_inline_system_text_blocks_without_repositioning() -> None:
-    request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "messages": [
-                {"role": "user", "content": "Before"},
-                {
-                    "role": "system",
-                    "content": [
-                        {"type": "text", "text": "First instruction"},
-                        {"type": "text", "text": "Second instruction"},
-                    ],
-                },
-            ],
-        }
-    )
-
-    body = build_base_request_body(request)
-
-    assert body["messages"] == [
-        {
-            "role": "user",
-            "content": "Before\n\nFirst instruction\n\nSecond instruction",
-        }
-    ]
-
-
-def test_inline_system_message_preserves_existing_openai_cache_prefix() -> None:
-    prefix_request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "system": "Conversation-wide instructions",
-            "messages": [
-                {"role": "user", "content": "First question"},
-                {"role": "assistant", "content": "First answer"},
-            ],
-        }
-    )
-    continued_request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "system": "Conversation-wide instructions",
-            "messages": [
-                {"role": "user", "content": "First question"},
-                {"role": "assistant", "content": "First answer"},
-                {"role": "user", "content": "Second question"},
-                {
-                    "role": "system",
-                    "content": (
-                        "<system-reminder>Instructions from this point"
-                        "</system-reminder>"
-                    ),
-                },
-            ],
-        }
-    )
-
-    prefix = build_base_request_body(prefix_request)["messages"]
-    continued = build_base_request_body(continued_request)["messages"]
-
-    assert continued[: len(prefix)] == prefix
-    assert continued[len(prefix) :] == [
-        {
-            "role": "user",
-            "content": (
-                "Second question\n\n<system-reminder>Instructions from this point"
-                "</system-reminder>"
-            ),
-        }
-    ]
-
-
-def test_inline_system_message_coalesces_with_multimodal_user_content() -> None:
-    request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "messages": [
-                {"role": "user", "content": "Existing context."},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "url",
-                                "url": "https://example.com/image.png",
-                            },
-                        },
-                        {"type": "text", "text": "Inspect this image."},
-                    ],
-                },
-                {"role": "system", "content": "Focus on correctness."},
-            ],
-        }
-    )
-
-    body = build_base_request_body(request)
-
-    assert body["messages"] == [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Existing context."},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "https://example.com/image.png"},
-                },
-                {
-                    "type": "text",
-                    "text": "Inspect this image.\n\nFocus on correctness.",
-                },
-            ],
-        }
-    ]
-
-
-def test_inline_system_message_follows_completed_tool_result() -> None:
-    request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "messages": [
-                {"role": "user", "content": "Use the tool"},
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "call_1",
-                            "name": "Read",
-                            "input": {},
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "call_1",
-                            "content": "done",
-                        }
-                    ],
-                },
-                {"role": "system", "content": "New instructions"},
-            ],
-        }
-    )
-
-    body = build_base_request_body(request)
-
-    assert [message["role"] for message in body["messages"]] == [
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-        "user",
-    ]
-    assert body["messages"][3] == {"role": "assistant", "content": " "}
-    assert body["messages"][-1]["content"] == "New instructions"
-
-
-def test_openai_build_rejects_non_text_inline_system_blocks() -> None:
-    request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "url",
-                                "url": "https://example.com/a.png",
-                            },
-                        }
-                    ],
-                }
-            ],
-        }
-    )
-
-    with pytest.raises(
-        OpenAIConversionError,
-        match="inline Anthropic system message content block 'image' without data loss",
-    ):
-        build_base_request_body(request)
-
-
-@pytest.mark.parametrize(
-    "content",
-    [[], "", [{"type": "text", "text": ""}]],
-    ids=["empty_list", "empty_string", "empty_text_block"],
-)
-@pytest.mark.parametrize("position", [0, 1, 2, 3])
-def test_openai_build_omits_empty_inline_system_content(content, position) -> None:
-    history = [
-        {"role": "user", "content": "First question"},
-        {"role": "assistant", "content": "First answer"},
-        {"role": "user", "content": "Second question"},
-    ]
-    request = MessagesRequest.model_validate(
-        {
-            "model": "model",
-            "system": "Conversation-wide instructions",
-            "messages": [
-                *history[:position],
-                {"role": "system", "content": content},
-                *history[position:],
-            ],
-        }
-    )
-
-    body = build_base_request_body(request)
-
-    assert body["messages"] == [
-        {"role": "system", "content": "Conversation-wide instructions"},
-        *history,
-    ]
-
-
 # --- Tool Conversion Tests ---
 
 
@@ -516,12 +264,8 @@ def test_convert_assistant_message_thinking():
     result = AnthropicToOpenAIConverter.convert_messages(messages)
 
     assert len(result) == 1
-    # Expecting <think> tags
-    expected_content = (
-        "<think>\nI need to calculate this.\n</think>\n\nThe answer is 4."
-    )
-    assert result[0]["content"] == expected_content
-    assert "reasoning_content" not in result[0]
+    assert result[0]["content"] == "The answer is 4."
+    assert result[0]["reasoning_content"] == "I need to calculate this."
 
 
 def test_convert_assistant_message_thinking_replays_reasoning_content():
@@ -732,17 +476,17 @@ def _convert_tool_turn(
     )
 
 
-def test_convert_assistant_tool_use_without_thinking_replays_empty_reasoning_content():
+def test_convert_assistant_tool_use_without_thinking_defers_placeholder():
     result = _convert_tool_turn(
         [MockBlock(type="tool_use", id="call_missing", name="Read", input={})]
     )
 
     assert result[0]["content"] == ""
-    assert result[0]["reasoning_content"] == ""
+    assert "reasoning_content" not in result[0]
     assert result[0]["tool_calls"][0]["id"] == "call_missing"
 
 
-def test_convert_parallel_tool_use_without_thinking_replays_one_empty_reasoning_field():
+def test_convert_parallel_tool_use_without_thinking_defers_placeholder():
     result = _convert_tool_turn(
         [
             MockBlock(type="tool_use", id="call_1", name="Read", input={}),
@@ -750,14 +494,14 @@ def test_convert_parallel_tool_use_without_thinking_replays_one_empty_reasoning_
         ]
     )
 
-    assert result[0]["reasoning_content"] == ""
+    assert "reasoning_content" not in result[0]
     assert [tool_call["id"] for tool_call in result[0]["tool_calls"]] == [
         "call_1",
         "call_2",
     ]
 
 
-def test_convert_redacted_thinking_tool_use_replays_empty_reasoning_without_data():
+def test_convert_redacted_thinking_tool_use_preserves_native_data_without_placeholder():
     result = _convert_tool_turn(
         [
             MockBlock(type="redacted_thinking", data="opaque-secret"),
@@ -765,11 +509,10 @@ def test_convert_redacted_thinking_tool_use_replays_empty_reasoning_without_data
         ]
     )
 
-    assert result[0]["reasoning_content"] == ""
+    assert "reasoning_content" not in result[0]
     assert result[0]["reasoning_details"] == [
         {"type": "reasoning.encrypted", "data": "opaque-secret"}
     ]
-    assert "opaque-secret" not in result[0]["reasoning_content"]
 
 
 def test_convert_text_only_assistant_without_thinking_omits_reasoning_content():
@@ -784,9 +527,8 @@ def test_convert_text_only_assistant_without_thinking_omits_reasoning_content():
 @pytest.mark.parametrize(
     "reasoning_replay",
     [
-        ReasoningReplayMode.THINK_TAGS,
+        ReasoningReplayMode.REASONING_CONTENT,
         ReasoningReplayMode.REASONING,
-        ReasoningReplayMode.DISABLED,
     ],
 )
 def test_convert_tool_use_without_thinking_does_not_change_other_replay_modes(
@@ -800,7 +542,7 @@ def test_convert_tool_use_without_thinking_does_not_change_other_replay_modes(
     assert "reasoning_content" not in result[0]
 
 
-def test_convert_assistant_message_thinking_becomes_context_when_disabled():
+def test_convert_assistant_message_thinking_uses_native_field():
     content = [
         MockBlock(type="thinking", thinking="I need to calculate this."),
         MockBlock(type="text", text="The answer is 4."),
@@ -808,19 +550,16 @@ def test_convert_assistant_message_thinking_becomes_context_when_disabled():
     messages = [MockMessage("assistant", content)]
     result = AnthropicToOpenAIConverter.convert_messages(
         messages,
-        reasoning_replay=ReasoningReplayMode.DISABLED,
+        reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
     )
 
     assert len(result) == 1
-    assert "reasoning_content" not in result[0]
+    assert result[0]["reasoning_content"] == "I need to calculate this."
     assert "<think>" not in result[0]["content"]
-    assert (
-        result[0]["content"]
-        == "[Earlier reasoning]\nI need to calculate this.\n\nThe answer is 4."
-    )
+    assert result[0]["content"] == "The answer is 4."
 
 
-def test_convert_assistant_top_level_reasoning_becomes_context_when_disabled():
+def test_convert_assistant_top_level_reasoning_uses_native_field():
     messages = [
         MockMessage(
             "assistant",
@@ -829,13 +568,14 @@ def test_convert_assistant_top_level_reasoning_becomes_context_when_disabled():
         )
     ]
     result = AnthropicToOpenAIConverter.convert_messages(
-        messages, reasoning_replay=ReasoningReplayMode.DISABLED
+        messages, reasoning_replay=ReasoningReplayMode.REASONING_CONTENT
     )
 
     assert result == [
         {
             "role": "assistant",
-            "content": "[Earlier reasoning]\nI need to calculate this.\n\nThe answer is 4.",
+            "content": "The answer is 4.",
+            "reasoning_content": "I need to calculate this.",
         }
     ]
 
@@ -947,7 +687,7 @@ def test_convert_mixed_blocks_and_types_and_roles():
 
     assert len(result) == 4
     assert result[0]["role"] == "user"
-    assert "<think>" in result[1]["content"]
+    assert result[1]["reasoning_content"] == "Thinking..."
     assert result[2]["tool_calls"][0]["id"] == "t1"
 
 
@@ -1071,11 +811,8 @@ def test_convert_assistant_interleaved_order_preserved():
 
     assert len(result) == 2
     msg = result[0]
-    # Expected: thinking1, text, thinking2 in that order within content; tool_calls at end
-    expected_content = "<think>\nFirst thought.\n</think>\n\nHere is the answer.\n\n<think>\nSecond thought.\n</think>"
-    assert msg["content"] == expected_content, (
-        f"Interleaved order lost. Got: {msg['content']!r}"
-    )
+    assert msg["content"] == "Here is the answer."
+    assert msg["reasoning_content"] == "First thought.\nSecond thought."
     assert len(msg["tool_calls"]) == 1
 
 

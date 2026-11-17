@@ -9,6 +9,8 @@ from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.custom_providers import CustomProviderDefinition
 from free_claude_code.core.anthropic import MessagesRequest, ReasoningReplayMode
+from free_claude_code.core.chat_completions.request import ChatRequest
+from free_claude_code.core.gemini import GeminiRequest
 from free_claude_code.core.openai_responses import (
     OpenAIResponsesRequest,
     responses_reasoning_policy,
@@ -18,6 +20,7 @@ from free_claude_code.core.reasoning import (
     ReasoningEffort,
     ReasoningPolicy,
 )
+from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
@@ -35,6 +38,7 @@ from free_claude_code.providers.anthropic_messages.transport import (
 )
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.endpoint_types import HttpEndpoint
+from free_claude_code.providers.history_negotiation import HistoryModeCache
 from free_claude_code.providers.model_listing import (
     extract_openai_model_infos,
     model_infos_from_ids,
@@ -95,10 +99,11 @@ class CustomProvider(BaseProvider):
         *,
         definition: CustomProviderDefinition,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
         openai_transport: httpx2.AsyncBaseTransport | None = None,
         messages_transport: httpx.AsyncBaseTransport | None = None,
     ):
-        super().__init__(config)
+        super().__init__(config, history_cache=history_cache)
         self._definition = definition
         self._admission = admission
         self._snapshot = HttpEndpoint(
@@ -140,6 +145,7 @@ class CustomProvider(BaseProvider):
             self._messages = AnthropicMessagesTransport(
                 client=self._http,
                 admission=admission,
+                history_cache=self._history_cache,
                 provider_name=definition.provider_id,
                 replay_scope=definition.provider_id,
                 read_timeout_s=config.http_read_timeout,
@@ -168,6 +174,7 @@ class CustomProvider(BaseProvider):
                 self._chat = OpenAIChatTransport(
                     client=self._sdk,
                     admission=admission,
+                    history_cache=self._history_cache,
                     behavior=OpenAIChatBehavior(profile),
                     read_timeout_s=config.http_read_timeout,
                     log_raw_sse_events=config.log_raw_sse_events,
@@ -178,14 +185,12 @@ class CustomProvider(BaseProvider):
                 self._responses = OpenAIResponsesTransport(
                     client=self._sdk,
                     admission=admission,
+                    history_cache=self._history_cache,
                     provider_name=definition.provider_id,
                     read_timeout_s=config.http_read_timeout,
                     log_raw_sse_events=config.log_raw_sse_events,
                     endpoint_transport=openai_transport,
                 )
-
-    async def endpoint(self, *, force_refresh: bool = False) -> HttpEndpoint:
-        return self._snapshot
 
     async def cleanup(self) -> None:
         if self._sdk is not None:
@@ -221,7 +226,7 @@ class CustomProvider(BaseProvider):
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         continuation: ContinuationSeed | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         reasoning = self._reasoning(reasoning)
         if (
             self._definition.reasoning_format == "provider_default"
@@ -240,7 +245,7 @@ class CustomProvider(BaseProvider):
         if self._messages is not None:
             return self._messages.stream_messages(
                 request,
-                endpoint_context=self,
+                endpoint_context=self._snapshot,
                 request_id=request_id,
                 response_model=response_model,
                 reasoning=reasoning,
@@ -254,11 +259,81 @@ class CustomProvider(BaseProvider):
         return transport.stream_messages(
             request,
             input_tokens=input_tokens,
-            endpoint_context=self,
+            endpoint_context=self._snapshot,
             request_id=request_id,
             response_model=response_model or request.model,
             reasoning=reasoning,
             model_info=model_info,
+            continuation=continuation,
+        )
+
+    def stream_chat(
+        self,
+        request: ChatRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        reasoning = self._reasoning(reasoning)
+        if self._messages is not None:
+            return self._messages.stream_chat(
+                request,
+                endpoint_context=self._snapshot,
+                request_id=request_id,
+                response_model=response_model,
+                reasoning=reasoning,
+                model_info=model_info,
+                continuation=continuation,
+            )
+        transport = self._chat if self._chat is not None else self._responses
+        assert transport is not None
+        return transport.stream_chat(
+            request,
+            input_tokens=input_tokens,
+            endpoint_context=self._snapshot,
+            request_id=request_id,
+            response_model=response_model or request.model,
+            reasoning=reasoning,
+            continuation=continuation,
+        )
+
+    def stream_gemini(
+        self,
+        request: GeminiRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        reasoning = self._reasoning(reasoning)
+        if self._messages is not None:
+            return self._messages.stream_gemini(
+                request,
+                endpoint_context=self._snapshot,
+                request_id=request_id,
+                response_model=response_model,
+                reasoning=reasoning,
+                model_info=model_info,
+                continuation=continuation,
+            )
+        transport = self._chat if self._chat is not None else self._responses
+        assert transport is not None
+        return transport.stream_gemini(
+            request,
+            input_tokens=input_tokens,
+            endpoint_context=self._snapshot,
+            request_id=request_id,
+            response_model=response_model or request.model,
+            reasoning=reasoning,
             continuation=continuation,
         )
 
@@ -273,7 +348,7 @@ class CustomProvider(BaseProvider):
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         continuation: ContinuationSeed | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         reasoning = (
             responses_reasoning_policy(request.reasoning)
             if self._definition.reasoning_format == "provider_default"
@@ -296,7 +371,7 @@ class CustomProvider(BaseProvider):
         if self._messages is not None:
             return self._messages.stream_responses(
                 request,
-                endpoint_context=self,
+                endpoint_context=self._snapshot,
                 request_id=request_id,
                 response_model=response_model,
                 reasoning=reasoning,
@@ -308,7 +383,7 @@ class CustomProvider(BaseProvider):
         return transport.stream_responses(
             request,
             input_tokens=input_tokens,
-            endpoint_context=self,
+            endpoint_context=self._snapshot,
             request_id=request_id,
             response_model=response_model or request.model,
             reasoning=reasoning,
@@ -322,7 +397,7 @@ class CustomProvider(BaseProvider):
             binding = OpenAIRequestClient(self._openai_transport)
             try:
                 client = binding.for_endpoint(self._sdk, self._snapshot)
-                payload = await self._admission.start_execution().run_call(
+                payload = await self._admission.start_execution(model=None).run_call(
                     lambda: client.models.list(extra_headers=binding.openai_headers()),
                     operation_kind=ProviderOperationKind.MODEL_DISCOVERY,
                 )

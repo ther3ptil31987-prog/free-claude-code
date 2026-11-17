@@ -1,9 +1,10 @@
 """Canonical managed-config loading, precedence, provenance, and caching."""
 
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -22,6 +23,7 @@ from .env_migrations import (
     consolidate_managed_config,
     settings_env_keys,
 )
+from .errors import ConfigConflictError
 from .model_refs import normalize_retired_model_settings
 from .paths import config_lock_path, managed_env_path
 from .provider_proxies import invalid_provider_proxy_keys
@@ -50,8 +52,8 @@ class ManagedConfigSnapshot:
 
     settings: Settings
     sources: Mapping[str, ConfigSource]
-    managed: Mapping[str, str]
-    process: Mapping[str, str]
+    managed: Mapping[str, str] = dataclass_field(repr=False)
+    process: Mapping[str, str] = dataclass_field(repr=False)
     path: Path
 
 
@@ -63,7 +65,7 @@ class ManagedConfigStore:
         self._lock_path = config_lock_path()
 
     @contextmanager
-    def _storage_lock(self) -> Iterator[None]:
+    def _storage_lock(self) -> Generator[None]:
         lock = InterprocessFileLock(self._lock_path)
         if not lock.acquire(wait=True, timeout=10.0):
             raise TimeoutError(
@@ -106,9 +108,21 @@ class ManagedConfigStore:
             self.path,
         )
 
-    def commit(self, values: Mapping[str, str]) -> None:
+    def commit(
+        self,
+        values: Mapping[str, str],
+        expected: ManagedConfigSnapshot | None = None,
+    ) -> None:
         with self._storage_lock():
-            self._read_managed()  # Never overwrite a newer schema or missing storage.
+            managed = self._read_managed()
+            if expected is not None and (
+                managed != expected.managed
+                or _process_overrides(os.environ)
+                != _process_overrides(expected.process)
+            ):
+                raise ConfigConflictError(
+                    "Configuration changed while saving. Reopen the modal before saving again."
+                )
             atomic_write_managed_config(values, path=self.path)
 
     def repair_invalid_provider_proxies(
@@ -169,6 +183,12 @@ def compose_settings_snapshot(
     )
 
 
+def _process_overrides(env: Mapping[str, str]) -> dict[str, str]:
+    normalized = normalize_retired_model_settings(env, preserve_empty_overrides=True)
+    keys = settings_env_keys() - {ANTHROPIC_AUTH_TOKEN_ENV}
+    return {key: normalized[key] for key in keys & normalized.keys()}
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Return the process-wide cached settings model."""
@@ -187,8 +207,6 @@ def clear_settings_cache() -> None:
 def _settings_aliases() -> dict[str, str]:
     aliases: dict[str, str] = {}
     for name, field in Settings.model_fields.items():
-        if name == "nim":
-            continue
         alias = field.validation_alias
         if not isinstance(alias, str):
             raise AssertionError(f"Settings field {name!r} needs one string alias")

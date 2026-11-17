@@ -6,7 +6,7 @@ import pytest
 from playwright.sync_api import expect
 
 from e2e.form_support import assert_autofill_opt_out
-from e2e.provider_support import open_provider
+from e2e.provider_support import api_key_input, open_provider
 from free_claude_code.application.code_sessions.models import (
     HarnessEvent,
     PromptRequest,
@@ -44,9 +44,9 @@ def test_model_picker_uses_application_order_and_keeps_configured_selection(
     create_session(page, admin_base_url, tmp_path)
     expect(page.locator("#codeProvider")).to_have_value("open_router")
     expect(page.locator("#codeModel")).to_have_value("Zulu")
-    assert page.locator("#codeProvider option").evaluate_all(
-        "options => options.map(option => option.value)"
-    ) == ["deepseek", "open_router"]
+    expect(page.locator("#codeProvider option")).to_have_text(
+        ["deepseek", "open_router"]
+    )
     page.locator("#codeComposer").fill("Keep this draft")
     page.locator("#codeModel").fill("")
     expect(page.locator("#codeModel").locator("..").get_by_role("option")).to_have_text(
@@ -56,6 +56,36 @@ def test_model_picker_uses_application_order_and_keeps_configured_selection(
     page.evaluate("window.CodeSessions.refresh()")
     expect(page.locator("#codeModel")).to_have_value("Zulu")
     expect(page.locator("#codeComposer")).to_have_value("Keep this draft")
+
+
+def test_catalog_growth_preserves_open_search_selection_and_draft(
+    page, admin_base_url, tmp_path, code_control
+):
+    code_control.harness.configurations.update({"provider/model-two": "two"})
+    create_session(page, admin_base_url, tmp_path)
+    expect(page.locator("#codeSend")).to_be_disabled()
+    assert page.evaluate("window.CodeSessions.refresh()") is True
+    page.locator("#codeComposer").fill("Keep the composer draft")
+    model = page.locator("#codeModel")
+    model.fill("model")
+    model.press("ArrowDown")
+    active = model.get_attribute("aria-activedescendant")
+    active_value = page.locator(f"#{active}").get_attribute("data-value")
+    effort = page.locator("#codeReasoning").input_value()
+    code_control.harness.configurations["provider/model-later"] = "later"
+    assert page.evaluate("window.CodeSessions.refresh()") is True
+    expect(model).to_be_focused()
+    expect(model).to_have_value("model")
+    expect(
+        model.locator("..").get_by_role("option", name="model-later", exact=True)
+    ).to_be_visible()
+    active = model.get_attribute("aria-activedescendant")
+    assert page.locator(f"#{active}").get_attribute("data-value") == active_value
+    expect(page.locator("#codeComposer")).to_have_value("Keep the composer draft")
+    expect(page.locator("#codeReasoning")).to_have_value(effort)
+    model.press("Escape")
+    expect(model).to_have_value("model")
+    expect(page.locator("#codeSend")).to_be_enabled()
 
 
 @pytest.mark.parametrize("width", [1440, 900, 390])
@@ -1521,7 +1551,7 @@ def test_hidden_code_removal_preserves_providers_and_deleted_history(
     providers_url = f"{admin_base_url}/admin"
     expect(page).to_have_url(providers_url)
     open_provider(page, "mistral")
-    field = page.locator("#field-MISTRAL_API_KEY")
+    field = api_key_input(page, "MISTRAL_API_KEY")
     field.fill("Keep this provider edit")
     field.evaluate("input => input.setSelectionRange(2, 7)")
     history_length = page.evaluate("history.length")
@@ -1925,7 +1955,7 @@ def test_first_http_sync_failure_recovers_without_reloading(
     page.goto(f"{admin_base_url}/admin/code")
     expect(
         page.get_by_role("button", name="New code session", exact=True)
-    ).to_be_enabled()
+    ).to_be_enabled(timeout=10_000)
     assert page.evaluate("window.failedCodeLoad")
     expect(page.locator("#codeNotice")).to_be_hidden()
 

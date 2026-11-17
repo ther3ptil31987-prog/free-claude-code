@@ -20,7 +20,6 @@ from free_claude_code.core.anthropic.models import (
     Tool,
 )
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
-from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.openai_chat import is_synthetic_chat_tool_turn_boundary
 from free_claude_code.core.openai_responses.models import OpenAIResponsesRequest
 from free_claude_code.providers.deepseek import DeepSeekProvider
@@ -32,6 +31,7 @@ from tests.providers.support import (
     immediate_admission,
     make_provider_config,
     reasoning_for,
+    sdk_chat_chunk,
 )
 
 
@@ -1110,45 +1110,52 @@ async def test_stream_uses_chat_completions_and_maps_cache_usage(deepseek_provid
     )
 
     async def fake_stream():
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content="hello", reasoning_content=None, tool_calls=None
-                    ),
-                    finish_reason=None,
-                )
-            ],
-            usage=None,
+        yield sdk_chat_chunk(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="hello", reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
         )
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content=None, reasoning_content=None, tool_calls=None
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-            usage=None,
+        yield sdk_chat_chunk(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None, reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
         )
-        yield SimpleNamespace(
-            choices=[],
-            usage=SimpleNamespace(
-                completion_tokens=3,
-                prompt_tokens=30,
-                prompt_cache_hit_tokens=10,
-                prompt_cache_miss_tokens=20,
-            ),
+        yield sdk_chat_chunk(
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(
+                    completion_tokens=3,
+                    prompt_tokens=30,
+                    prompt_cache_hit_tokens=10,
+                    prompt_cache_miss_tokens=20,
+                ),
+            )
         )
 
     create = AsyncMock(return_value=SDKStreamDouble(fake_stream()))
     with patch.object(deepseek_provider._client.chat.completions, "create", create):
         chunks = [
-            chunk
+            frame
             async for chunk in deepseek_provider.stream_messages(
                 request, input_tokens=7, request_id="r1"
             )
+            for frame in chunk.frames
         ]
 
     create.assert_awaited_once()
@@ -1174,47 +1181,54 @@ async def test_responses_stream_maps_deepseek_cache_usage(deepseek_provider):
     request = OpenAIResponsesRequest(model="m", input="hi")
 
     async def fake_stream():
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content="hello", reasoning_content=None, tool_calls=None
-                    ),
-                    finish_reason=None,
-                )
-            ],
-            usage=None,
+        yield sdk_chat_chunk(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="hello", reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
         )
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content=None, reasoning_content=None, tool_calls=None
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-            usage=None,
+        yield sdk_chat_chunk(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None, reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
         )
-        yield SimpleNamespace(
-            choices=[],
-            usage=SimpleNamespace(
-                completion_tokens=3,
-                prompt_tokens=30,
-                model_extra={
-                    "prompt_cache_hit_tokens": 10,
-                    "prompt_cache_miss_tokens": 20,
-                },
-            ),
+        yield sdk_chat_chunk(
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(
+                    completion_tokens=3,
+                    prompt_tokens=30,
+                    model_extra={
+                        "prompt_cache_hit_tokens": 10,
+                        "prompt_cache_miss_tokens": 20,
+                    },
+                ),
+            )
         )
 
     create = AsyncMock(return_value=SDKStreamDouble(fake_stream()))
     with patch.object(deepseek_provider._client.chat.completions, "create", create):
         chunks = [
-            chunk
+            frame
             async for chunk in deepseek_provider.stream_responses(
                 request, input_tokens=7, request_id="r1"
             )
+            for frame in chunk.frames
         ]
 
     parsed = parse_sse_text("".join(chunks))
@@ -1881,7 +1895,7 @@ def test_shared_conversion_rejects_assistant_image(deepseek_provider):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wire_api", ["messages", "responses"])
-async def test_upstream_image_rejection_preserves_image_and_fails_once(
+async def test_upstream_image_rejection_replaces_image_with_a_note(
     deepseek_provider, wire_api
 ):
     if wire_api == "messages":
@@ -1938,34 +1952,43 @@ async def test_upstream_image_rejection_preserves_image_and_fails_once(
         },
     )
 
-    try:
-        with (
-            patch.object(
-                deepseek_provider._client.chat.completions,
-                "create",
-                new_callable=AsyncMock,
-                side_effect=error,
-            ) as create,
-            pytest.raises(ExecutionFailure) as exc_info,
-        ):
-            async for _ in stream:
-                pass
+    async def answered():
+        for delta, finish_reason in (("I cannot see the image.", None), (None, "stop")):
+            yield sdk_chat_chunk(
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                content=delta, reasoning_content=None, tool_calls=None
+                            ),
+                            finish_reason=finish_reason,
+                        )
+                    ],
+                    usage=None,
+                )
+            )
 
-        assert create.call_count == 1
-        assert create.call_args.kwargs["messages"] == [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,YQ=="},
-                    }
-                ],
-            }
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}}
+    note = {
+        "type": "text",
+        "text": (
+            "[image omitted: this model cannot accept image input. "
+            "Tell the user the image was not seen.]"
+        ),
+    }
+    try:
+        with patch.object(
+            deepseek_provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[error, SDKStreamDouble(answered())],
+        ) as create:
+            text = "".join([frame async for chunk in stream for frame in chunk.frames])
+
+        assert "I cannot see the image." in text
+        assert [call.kwargs["messages"] for call in create.call_args_list] == [
+            [{"role": "user", "content": [image]}],
+            [{"role": "user", "content": [note]}],
         ]
-        assert exc_info.value.kind is FailureKind.INVALID_REQUEST
-        assert exc_info.value.status_code == 400
-        assert exc_info.value.retryable is False
-        assert "does not support image inputs" in exc_info.value.message
     finally:
         await deepseek_provider.cleanup()

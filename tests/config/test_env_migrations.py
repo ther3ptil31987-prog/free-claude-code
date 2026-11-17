@@ -16,6 +16,78 @@ from free_claude_code.config.env_migrations import (
     migrate_env_setting_in_text,
 )
 from free_claude_code.config.loader import ManagedConfigStore
+from free_claude_code.config.model_refs import ModelFallback, decode_model_fallbacks
+
+
+@pytest.mark.parametrize(
+    "schema", ["", "FCC_CONFIG_SCHEMA=1\n", "FCC_CONFIG_SCHEMA=2\n"]
+)
+def test_super_migration_persists_once_preserving_other_settings(
+    monkeypatch, tmp_path, schema
+):
+    managed, _ = _paths(monkeypatch, tmp_path)
+    managed.parent.mkdir(parents=True)
+    old = "nvidia_nim/nvidia/nemotron-3-super-120b-a12b"
+    new = "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
+    managed.write_text(
+        schema + f"MODEL={old}\nMODEL_OPUS={old}\nMODEL_SONNET=groq/other\n"
+        f"MODEL_FALLBACKS={old},groq/backup\nREASONING_OPUS=off\n"
+        "NVIDIA_NIM_API_KEY=keep-secret\nUNKNOWN_PRIVATE=keep-unknown\n",
+        encoding="utf-8",
+    )
+    store = ManagedConfigStore()
+    store.initialize({})
+    values = dotenv_values_from_file(managed)
+    assert values["MODEL"] == values["MODEL_OPUS"] == new
+    assert values["MODEL_SONNET"] == "groq/other"
+    assert values["REASONING_OPUS"] == "off"
+    assert decode_model_fallbacks(values["MODEL_FALLBACKS"]) == (
+        ModelFallback(model=new),
+        ModelFallback(model="groq/backup"),
+    )
+    assert (
+        store.read({}).settings.nvidia_nim_api_keys[0].get_secret_value()
+        == "keep-secret"
+    )
+    assert values["UNKNOWN_PRIVATE"] == "keep-unknown"
+    before = managed.read_bytes(), managed.stat().st_mtime_ns
+    store.initialize({})
+    assert (managed.read_bytes(), managed.stat().st_mtime_ns) == before
+
+
+def test_super_migration_imports_legacy_selection_without_editing_source(
+    monkeypatch, tmp_path
+):
+    managed, legacy = _paths(monkeypatch, tmp_path)
+    legacy.parent.mkdir(parents=True)
+    original = "MODEL=nvidia_nim/nvidia/nemotron-3-super-120b-a12b\nNVIDIA_NIM_API_KEY=keep-secret\n"
+    legacy.write_text(original, encoding="utf-8")
+    consolidate_managed_config({})
+    assert (
+        dotenv_values_from_file(managed)["MODEL"]
+        == "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
+    )
+    assert legacy.read_text(encoding="utf-8") == original
+
+
+def test_super_migration_atomic_write_failure_preserves_managed_file(
+    monkeypatch, tmp_path
+):
+    managed, _ = _paths(monkeypatch, tmp_path)
+    managed.parent.mkdir(parents=True)
+    original = (
+        b"FCC_CONFIG_SCHEMA=2\nMODEL=nvidia_nim/nvidia/nemotron-3-super-120b-a12b\n"
+    )
+    managed.write_bytes(original)
+
+    def fail_replace(*args):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(env_migrations.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected"):
+        consolidate_managed_config({})
+    assert managed.read_bytes() == original
+    assert list(managed.parent.glob("*.tmp")) == []
 
 
 @pytest.mark.parametrize("schema", ["", "FCC_CONFIG_SCHEMA=1\n"])
@@ -34,7 +106,10 @@ def test_retired_models_repair_managed_config_once_preserving_unknowns(
     assert consolidate_managed_config({}).changed
     values = dotenv_values_from_file(managed)
     assert "MODEL" not in values and "MODEL_OPUS" not in values
-    assert values["MODEL_FALLBACKS"] == "groq/a,deepseek/b"
+    assert decode_model_fallbacks(values["MODEL_FALLBACKS"]) == (
+        ModelFallback(model="groq/a"),
+        ModelFallback(model="deepseek/b"),
+    )
     assert values["REASONING_OPUS"] == "off"
     assert values["GITHUB_MODELS_TOKEN"] == "retired-secret"
     assert values["GITHUB_MODELS_PROXY"] == "http://user:password@proxy.test"
@@ -132,7 +207,7 @@ def test_legacy_file_imports_only_recognized_values_and_is_untouched(
 
     assert result.imported_from == (legacy.resolve(),)
     assert values["MODEL"] == "deepseek/legacy"
-    assert values["HUGGINGFACE_API_KEY"] == "hf"
+    assert values["HUGGINGFACE_API_KEY"] == '["hf"]'
     assert values["PROXY_AUTH_ENABLED"] == "false"
     assert "UNRELATED_SECRET" not in values
     assert legacy.read_text(encoding="utf-8") == original
@@ -188,7 +263,7 @@ def test_canonical_setting_wins_and_retired_key_is_removed(
     consolidate_managed_config({})
     values = dotenv_values_from_file(managed)
 
-    assert values["HUGGINGFACE_API_KEY"] == "current-token"
+    assert values["HUGGINGFACE_API_KEY"] == '["current-token"]'
     assert "HF_TOKEN" not in values
 
 
@@ -220,7 +295,7 @@ def test_post_schema_invalid_explicit_path_is_never_dereferenced(
 ) -> None:
     managed, _legacy = _paths(monkeypatch, tmp_path)
     managed.parent.mkdir(parents=True)
-    managed.write_text("FCC_CONFIG_SCHEMA=1\n", encoding="utf-8")
+    managed.write_text("FCC_CONFIG_SCHEMA=2\n", encoding="utf-8")
 
     result = consolidate_managed_config({"FCC_ENV_FILE": str(tmp_path / "missing.env")})
 
@@ -332,7 +407,7 @@ def test_only_managed_schema_marker_is_trusted(
     consolidate_managed_config({"FCC_CONFIG_SCHEMA": "99"})
 
     values = dotenv_values_from_file(managed)
-    assert values["FCC_CONFIG_SCHEMA"] == "1"
+    assert values["FCC_CONFIG_SCHEMA"] == "2"
     assert values["MODEL"] == "deepseek/imported"
 
 
@@ -399,7 +474,7 @@ def test_concurrent_loaders_produce_one_valid_managed_file(
     assert {snapshot.settings.model for snapshot in snapshots} == {
         "deepseek/concurrent"
     }
-    assert dotenv_values_from_file(managed)["FCC_CONFIG_SCHEMA"] == "1"
+    assert dotenv_values_from_file(managed)["FCC_CONFIG_SCHEMA"] == "2"
     assert list(managed.parent.glob("*.tmp")) == []
 
 
@@ -438,7 +513,7 @@ def test_newer_managed_schema_fails_closed(
 ) -> None:
     managed, _legacy = _paths(monkeypatch, tmp_path)
     managed.parent.mkdir(parents=True)
-    managed.write_text("FCC_CONFIG_SCHEMA=2\n", encoding="utf-8")
+    managed.write_text("FCC_CONFIG_SCHEMA=3\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="unsupported schema"):
         consolidate_managed_config({})

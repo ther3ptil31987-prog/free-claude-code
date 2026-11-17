@@ -9,6 +9,7 @@ import pytest
 from httpx2 import Request, Response
 from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
 
+from free_claude_code.application.response_collection import collected_frames
 from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.sse_aggregation import (
@@ -17,7 +18,6 @@ from free_claude_code.core.anthropic.sse_aggregation import (
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
-from free_claude_code.providers.admission import ProviderOperationKind
 from free_claude_code.providers.openai_chat import (
     OpenAIChatBehavior,
     OpenAIChatProfile,
@@ -31,12 +31,13 @@ from free_claude_code.providers.openai_chat.usage import (
     request_stream_usage,
     usage_int,
 )
-from free_claude_code.providers.request_recovery import RequestRecovery
 from tests.providers.request_factory import make_messages_request
 from tests.providers.support import (
     SDKStreamDouble,
+    completed_chat_stream,
     immediate_admission,
     make_provider_config,
+    sdk_chat_chunk,
 )
 
 
@@ -61,7 +62,7 @@ class _UsageTestProvider(OpenAIChatProvider):
                 OpenAIChatProfile(
                     OpenAIChatRequestPolicy(
                         provider_name="USAGE_TEST",
-                        reasoning_replay=ReasoningReplayMode.DISABLED,
+                        reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
                     ),
                     NO_REASONING,
                 )
@@ -90,19 +91,21 @@ def _chunk(
     usage: Any = None,
 ):
     if content is None and finish_reason is None:
-        return SimpleNamespace(choices=[], usage=usage)
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                delta=SimpleNamespace(
-                    content=content,
-                    reasoning_content=None,
-                    tool_calls=None,
-                ),
-                finish_reason=finish_reason,
-            )
-        ],
-        usage=usage,
+        return sdk_chat_chunk(SimpleNamespace(choices=[], usage=usage))
+    return sdk_chat_chunk(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=content,
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=usage,
+        )
     )
 
 
@@ -383,7 +386,9 @@ async def test_openai_chat_stream_requests_usage_and_uses_provider_prompt_tokens
 
     with patch.object(provider._client.chat.completions, "create", create):
         events = [
-            event async for event in provider.stream_messages(request, input_tokens=7)
+            frame
+            async for event in provider.stream_messages(request, input_tokens=7)
+            for frame in event.frames
         ]
 
     create.assert_awaited_once()
@@ -437,7 +442,9 @@ async def test_openai_chat_nonstream_message_uses_final_cache_partition():
 
     with patch.object(provider._client.chat.completions, "create", create):
         message, error, _complete = await aggregate_anthropic_sse_to_message(
-            provider.stream_messages(request, input_tokens=7)
+            collected_frames(
+                provider.stream_messages(request, input_tokens=7), protocol="messages"
+            )
         )
 
     assert error is None
@@ -476,7 +483,9 @@ async def test_openai_chat_responses_stream_preserves_cache_write_usage():
 
     with patch.object(provider._client.chat.completions, "create", create):
         events = [
-            event async for event in provider.stream_responses(request, input_tokens=7)
+            frame
+            async for event in provider.stream_responses(request, input_tokens=7)
+            for frame in event.frames
         ]
 
     completed = next(
@@ -513,11 +522,12 @@ async def test_openai_chat_stream_keeps_response_model_separate_from_upstream_mo
 
     with patch.object(provider._client.chat.completions, "create", create):
         events = [
-            event
+            frame
             async for event in provider.stream_messages(
                 request,
                 response_model="anthropic/test/upstream/model",
             )
+            for frame in event.frames
         ]
 
     assert create.await_args is not None
@@ -533,32 +543,23 @@ async def test_openai_chat_stream_keeps_response_model_separate_from_upstream_mo
 @pytest.mark.asyncio
 async def test_openai_chat_stream_retries_without_usage_when_option_is_rejected():
     provider = _UsageTestProvider()
-    body = {"model": "m", "messages": [{"role": "user", "content": "x"}]}
-    request_stream_usage(body)
     create = AsyncMock(
         side_effect=[
             _bad_request(
                 "stream_options is unsupported",
                 {"error": {"message": "stream_options is unsupported"}},
             ),
-            object(),
+            completed_chat_stream(),
         ]
     )
 
     with patch.object(provider._client.chat.completions, "create", create):
-        (
-            _stream_obj,
-            used_body,
-            attempt,
-            _sent_body,
-        ) = await provider._chat._create_stream(
-            body,
-            RequestRecovery(provider._admission.start_execution()),
-            ProviderOperationKind.GENERATION,
-        )
-        await attempt.aclose()
+        _ = [
+            frame
+            async for event in provider.stream_messages(make_messages_request("m"))
+            for frame in event.frames
+        ]
 
     assert create.await_count == 2
     assert create.await_args_list[0].kwargs["stream_options"] == {"include_usage": True}
     assert "stream_options" not in create.await_args_list[1].kwargs
-    assert "stream_options" not in used_body

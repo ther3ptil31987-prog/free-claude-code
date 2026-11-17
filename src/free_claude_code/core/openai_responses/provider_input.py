@@ -11,6 +11,7 @@ from free_claude_code.core.anthropic.image_sources import (
 )
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.request_serialization import (
+    is_noop_context_management,
     serialize_tool_result_content,
 )
 from free_claude_code.core.anthropic.tool_results import (
@@ -22,7 +23,9 @@ from free_claude_code.core.history_replay import (
     HistoryReplayError,
     has_readable_replay,
     is_replay,
+    readable_reasoning,
     tool_history_context,
+    unprotected_replay,
     validate_hosted_tool_history,
 )
 from free_claude_code.core.json_types import JsonObject
@@ -47,11 +50,7 @@ def build_responses_provider_request(
     instructions = _system_text(request)
     input_items: list[dict[str, Any]] = []
     for message in request.messages:
-        if message.role == "system":
-            text = _message_text(message.content, context="system message")
-            if text:
-                instructions.append(text)
-        elif message.role == "assistant":
+        if message.role == "assistant":
             input_items.extend(
                 _assistant_items(
                     message.content,
@@ -124,7 +123,7 @@ def _validate_supported_request(request: MessagesRequest) -> None:
         unsupported.append("stop_sequences")
     if request.top_k is not None:
         unsupported.append("top_k")
-    if not _is_noop_context_management(request.context_management):
+    if not is_noop_context_management(request.context_management):
         unsupported.append("context_management")
     unsupported.extend(_unsupported_output_config_paths(request.output_config))
     if request.mcp_servers:
@@ -144,25 +143,6 @@ def _unsupported_output_config_paths(
     if not output_config:
         return []
     return [f"output_config.{key}" for key in sorted(output_config) if key != "effort"]
-
-
-def _is_noop_context_management(
-    context_management: dict[str, Any] | None,
-) -> bool:
-    if not context_management:
-        return True
-    if set(context_management) != {"edits"}:
-        return False
-    edits = context_management["edits"]
-    return isinstance(edits, list) and all(
-        isinstance(edit, dict)
-        and edit
-        == {
-            "type": "clear_thinking_20251015",
-            "keep": "all",
-        }
-        for edit in edits
-    )
 
 
 def _system_text(request: MessagesRequest) -> list[str]:
@@ -226,6 +206,26 @@ def _assistant_items(
             )
             continue
         flush_text()
+        carrier = (
+            get_block_attr(block, "signature", None)
+            if kind == "thinking"
+            else get_block_attr(block, "data", None)
+            if kind == "redacted_thinking"
+            else None
+        )
+        if record := unprotected_replay(carrier):
+            items.append(
+                {
+                    "id": new_reasoning_item_id(),
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [
+                        {"type": "reasoning_text", "text": text}
+                        for text, _ in readable_reasoning(record.native)
+                    ],
+                }
+            )
+            continue
         if kind == "thinking":
             signature = get_block_attr(block, "signature", None)
             item: dict[str, Any] = {
@@ -235,6 +235,16 @@ def _assistant_items(
             }
             if isinstance(signature, str) and signature:
                 item["encrypted_content"] = signature
+                if not is_replay(signature):
+                    items.append(item)
+                    thinking = str(get_block_attr(block, "thinking", ""))
+                    if thinking:
+                        items.append(
+                            _assistant_message(
+                                [{"type": "output_text", "text": thinking}]
+                            )
+                        )
+                    continue
             if not signature or (
                 not is_replay(signature) or not has_readable_replay(signature)
             ):
@@ -356,19 +366,6 @@ def _image_part(block: Any) -> dict[str, Any]:
     except AnthropicImageSourceError as exc:
         raise ResponsesConversionError(str(exc)) from exc
     return {"type": "input_image", "image_url": url}
-
-
-def _message_text(content: Any, *, context: str) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        raise ResponsesConversionError(f"{context} must contain only text.")
-    parts: list[str] = []
-    for block in content:
-        if get_block_type(block) != "text":
-            raise ResponsesConversionError(f"{context} must contain only text.")
-        parts.append(str(get_block_attr(block, "text", "")))
-    return "\n\n".join(parts)
 
 
 def _assistant_message(content: list[dict[str, Any]]) -> dict[str, Any]:

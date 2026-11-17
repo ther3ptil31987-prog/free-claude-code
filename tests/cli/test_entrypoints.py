@@ -38,7 +38,6 @@ def test_cli_scripts_are_registered() -> None:
     )
 
     assert pyproject["project"]["scripts"] == {
-        "_fcc-update-check": "free_claude_code.updater.check:main",
         "fcc-server": "free_claude_code.cli.entrypoints:serve",
         "fcc-doctor": "free_claude_code.cli.entrypoints:doctor",
         "fcc-claude": "free_claude_code.cli.launchers.claude:launch",
@@ -50,6 +49,7 @@ def test_cli_scripts_are_registered() -> None:
         "fcc-dsh": "free_claude_code.cli.launchers.dsh:launch",
         "fcc-grok": "free_claude_code.cli.launchers.grok:launch",
         "fcc-muse": "free_claude_code.cli.launchers.muse:launch",
+        "fcc-agy": "free_claude_code.cli.launchers.agy:launch",
         "fcc-aider": "free_claude_code.cli.launchers.aider:launch",
     }
     assert pyproject["project"]["gui-scripts"] == {
@@ -104,7 +104,7 @@ def test_non_version_entrypoint_delegates_to_server_command() -> None:
     with patch.object(commands, "serve") as command:
         entrypoints.serve(())
 
-    command.assert_called_once_with()
+    command.assert_called_once_with(console_logging=True)
 
 
 def test_explicit_open_admin_waits_for_owned_http_ready():
@@ -159,7 +159,7 @@ def test_server_startup_repairs_invalid_managed_provider_proxy(
     managed.write_text(
         "\n".join(
             (
-                "FCC_CONFIG_SCHEMA=1",
+                "FCC_CONFIG_SCHEMA=2",
                 "MODEL=nvidia_nim/test-model",
                 f"OPENAI_PROXY={invalid_proxy}",
                 "",
@@ -270,7 +270,7 @@ def test_load_server_settings_leaves_process_owned_invalid_proxy_explicit(
     managed = managed_env_path()
     managed.parent.mkdir(parents=True)
     managed.write_text(
-        "FCC_CONFIG_SCHEMA=1\nOPENAI_PROXY=invalid://managed-proxy\n",
+        "FCC_CONFIG_SCHEMA=2\nOPENAI_PROXY=invalid://managed-proxy\n",
         encoding="utf-8",
     )
     baseline = managed.read_bytes()
@@ -454,7 +454,7 @@ def test_claude_child_env_targets_current_proxy_config() -> None:
     assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
     assert env["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
     assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "190000"
-    assert env["DISABLE_AUTOUPDATER"] == "1"
+    assert env["DISABLE_AUTOUPDATER"] == "0"
     assert env["DISABLE_FEEDBACK_COMMAND"] == "1"
     assert env["DISABLE_ERROR_REPORTING"] == "1"
     assert env["DISABLE_TELEMETRY"] == "0"

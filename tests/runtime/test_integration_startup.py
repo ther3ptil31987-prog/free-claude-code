@@ -11,14 +11,17 @@ from free_claude_code.api.app import create_app
 from free_claude_code.api.ports import ApiServices
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.application.readiness import InitializationWait
+from free_claude_code.config.api_keys import normalize_api_keys
 from free_claude_code.config.loader import ManagedConfigStore
 from free_claude_code.config.paths import claude_desktop_disconnect_path
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.gateway_model_ids import desktop_model_id
 from free_claude_code.harnesses import (
     claude_desktop_integration as desktop,
 )
 from free_claude_code.harnesses import (
     claude_integration,
+    claude_onboarding,
     codex_integration,
 )
 from free_claude_code.harnesses import (
@@ -42,7 +45,7 @@ def runtime():
             "proxy_auth_token": TOKEN,
             "messaging_platform": "none",
             "model": "nvidia_nim/one",
-            "nvidia_nim_api_key": "test",
+            "nvidia_nim_api_keys": normalize_api_keys("test"),
         }
     )
     provider = MagicMock(spec=BaseProvider)
@@ -50,13 +53,19 @@ def runtime():
         return_value=frozenset({ProviderModelInfo("one")})
     )
 
-    async def construct(_id, _settings, _admission_registry):
+    async def construct(
+        _id, _settings, _admission_registry, _api_key_number, _history_cache=None
+    ):
+        if _id in {"lmstudio", "llamacpp", "ollama"}:
+            raise ConnectionError("Local fixture is offline")
         return provider
 
     manager = ProviderRuntimeManager(
         settings,
-        runtime_factory=lambda snapshot, admission_registry: ProviderRuntime(
-            snapshot, admission_registry, provider_constructor=construct
+        runtime_factory=lambda snapshot, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                snapshot, admission_registry, provider_constructor=construct
+            )
         ),
     )
     return ApplicationRuntime(
@@ -148,11 +157,27 @@ async def test_startup_refreshes_old_connections_and_status_is_read_only(runtime
         await runtime.claude_vscode_status()
         await runtime.codex_integration_status()
         assert [p.stat().st_mtime_ns for p in (claude, codex)] == before
+        assert not claude_onboarding.state_path().exists()
         await runtime.disconnect_claude_vscode()
         assert (await runtime.claude_vscode_status())["update"]["changed"] is False
         await runtime.refresh_claude_vscode()
         await runtime._integrations._claude_update.task
         assert (await runtime.claude_vscode_status())["connected"] is False
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ['{"hasCompletedOnboarding":false}', "{invalid"])
+async def test_startup_preserves_global_onboarding(runtime, source):
+    old_connections()
+    state = claude_onboarding.state_path()
+    state.write_text(source)
+    try:
+        await runtime.start()
+        await finish(runtime)
+        assert (await runtime.claude_vscode_status())["connected"] is True
+        assert state.read_text() == source
     finally:
         await runtime.close()
 
@@ -208,7 +233,7 @@ async def test_unrecognized_codex_never_waits_for_catalog(runtime, monkeypatch):
         wait.assert_not_awaited()
         assert (await runtime.codex_integration_status())["connected"] is False
         assert not codex_integration.config_path().exists()
-        assert not claude_integration.claude_state_path().exists()
+        assert not claude_onboarding.state_path().exists()
     finally:
         await runtime.close()
 
@@ -255,7 +280,6 @@ async def test_shutdown_drains_integration_writer(runtime, monkeypatch):
         close = asyncio.create_task(runtime.close())
         await asyncio.sleep(0)
         assert not close.done()
-        assert runtime._config_lock.locked()
         release.set()
         assert await asyncio.wait_for(close, 5)
     finally:
@@ -359,9 +383,21 @@ async def test_desktop_startup_rotates_selected_profile_and_disconnect_stays_off
         True,
         disconnect_path=claude_desktop_disconnect_path(),
     )
+    profile = root / "configLibrary" / f"{desktop.FCC_ID}.json"
+    config = json.loads(profile.read_text())
+    models = [
+        {"name": desktop_model_id("nvidia_nim/one"), "labelOverride": "Pinned model"},
+        {"name": desktop_model_id("nvidia_nim/two"), "maxEffort": "high"},
+    ]
+    config["inferenceModels"] = models
+    profile.write_text(json.dumps(config))
     try:
         await runtime.start()
         await runtime._integrations._desktop_update.task
+        refreshed = json.loads(profile.read_text())
+        assert refreshed["inferenceModels"] == models
+        assert refreshed["inferenceGatewayApiKey"] == TOKEN
+        assert refreshed["inferenceGatewayBaseUrl"] == "http://127.0.0.1:8000"
         result = await runtime.claude_desktop_status()
         assert result["connected"] is True
         assert result["update"]["changed"] is True

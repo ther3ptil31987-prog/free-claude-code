@@ -57,6 +57,7 @@ from free_claude_code.core.openai_responses.provider_input import (
     build_responses_provider_request,
 )
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.core.version import package_version
 from free_claude_code.core.web_tools import WebFetchResult, WebSearchResult
@@ -139,13 +140,13 @@ def _local_tool_body(
         }
     )
 
-    async def unexpected_provider(_provider_id: str):
+    async def unexpected_provider(_provider_id: str, _api_key_number: int):
         pytest.fail("Forced local tools must not resolve a provider")
 
     service = WebToolService(
         settings=settings,
         client=StubWebToolsClient(),
-        executor=ProviderExecutor(unexpected_provider, progress_timeout_seconds=30),
+        executor=ProviderExecutor(unexpected_provider),
         token_counter=lambda *_: input_tokens,
     )
     routed = FixedProviderModelRouter(
@@ -153,7 +154,16 @@ def _local_tool_body(
     ).resolve_messages_request(request)
     body = service.try_stream_messages(routed, request_id="req_local_tool")
     assert isinstance(body, AsyncGenerator)
-    return body
+
+    async def frames():
+        try:
+            async for packet in body:
+                for frame in packet.frames:
+                    yield frame
+        finally:
+            await body.aclose()
+
+    return frames()
 
 
 class ScriptedSelectionProvider:
@@ -187,9 +197,9 @@ class ScriptedSelectionProvider:
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         continuation: ContinuationSeed | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         raise AssertionError("Web-search selection received a Responses request")
-        yield ""
+        yield StreamOutput(("",))
 
     async def stream_messages(
         self,
@@ -202,7 +212,7 @@ class ScriptedSelectionProvider:
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         continuation: ContinuationSeed | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         self.requests.append(request)
         self.stream_kwargs.append(
             {
@@ -219,7 +229,7 @@ class ScriptedSelectionProvider:
             if self.failure is not None and not self.failure_after_events:
                 raise self.failure
             for event in self.events:
-                yield event
+                yield StreamOutput((event,))
             if self.failure is not None:
                 raise self.failure
         finally:
@@ -384,7 +394,7 @@ def _automatic_search_service(
     effective_settings = settings or Settings()
     return MessagesHandler(
         effective_settings,
-        provider_resolver=AsyncMock(side_effect=lambda _: provider),
+        provider_resolver=AsyncMock(side_effect=lambda _, _api_key_number: provider),
         model_router=FixedProviderModelRouter(
             effective_settings,
             _PROVIDER_IDS[0],
@@ -608,7 +618,7 @@ async def test_service_rejects_forced_server_tool_when_local_handler_is_disabled
     assert settings.enable_web_server_tools is False
     service = MessagesHandler(
         settings,
-        provider_resolver=AsyncMock(side_effect=lambda _: MagicMock()),
+        provider_resolver=AsyncMock(side_effect=lambda _, _api_key_number: MagicMock()),
         model_router=FixedProviderModelRouter(settings, provider_id),
         web_tools=StubWebToolsClient(),
     )
@@ -1303,6 +1313,7 @@ def _aiohttp_response(
     if location is not None:
         hdrs["location"] = location
     r.headers = hdrs
+    r.charset = None
     r.get_encoding = MagicMock(return_value="utf-8")
     r.raise_for_status = MagicMock()
     r.request_info = MagicMock()
@@ -1916,7 +1927,7 @@ async def test_service_rejects_listed_server_tools_for_every_provider(
     settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": False})
     service = MessagesHandler(
         settings,
-        provider_resolver=AsyncMock(side_effect=lambda _: MagicMock()),
+        provider_resolver=AsyncMock(side_effect=lambda _, _api_key_number: MagicMock()),
         model_router=FixedProviderModelRouter(settings, provider_id),
         web_tools=StubWebToolsClient(),
     )

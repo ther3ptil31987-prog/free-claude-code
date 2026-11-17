@@ -12,6 +12,7 @@ from free_claude_code.api.ports import ApiServices
 from free_claude_code.application.errors import ApplicationUnavailableError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.application.readiness import InitializationWait
+from free_claude_code.config.api_keys import normalize_api_keys
 from free_claude_code.config.loader import ManagedConfigStore
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.async_tasks import run_sync_owned
@@ -21,6 +22,7 @@ from free_claude_code.runtime.application import ApplicationRuntime
 from free_claude_code.runtime.codex_catalog import CodexModelCatalogPublisher
 from free_claude_code.runtime.configuration import ConfigurationService
 from free_claude_code.runtime.provider_manager import ProviderRuntimeManager
+from tests.runtime.catalog_support import finish_discovery
 from tests.web_tools_support import StubWebToolsClient
 
 
@@ -28,8 +30,8 @@ def _settings():
     return Settings().model_copy(
         update={
             "model": "nvidia_nim/one",
-            "nvidia_nim_api_key": "test",
-            "groq_api_key": "test",
+            "nvidia_nim_api_keys": normalize_api_keys("test"),
+            "groq_api_keys": normalize_api_keys("test"),
             "messaging_platform": "none",
         }
     )
@@ -47,15 +49,23 @@ async def test_http_and_admin_serve_while_selected_catalog_is_held():
 
     provider.list_model_infos = AsyncMock(side_effect=list_models)
 
-    async def construct(_provider_id, _settings, _admission_registry):
+    async def construct(
+        _provider_id,
+        _settings,
+        _admission_registry,
+        _api_key_number,
+        _history_cache=None,
+    ):
         return provider
 
     manager = ProviderRuntimeManager(
         _settings(),
-        runtime_factory=lambda settings, admission_registry: ProviderRuntime(
-            settings,
-            admission_registry,
-            provider_constructor=construct,
+        runtime_factory=lambda settings, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                settings,
+                admission_registry,
+                provider_constructor=construct,
+            )
         ),
     )
     runtime = ApplicationRuntime(
@@ -96,15 +106,23 @@ async def test_independent_provider_and_cancelled_waiter_share_initialization():
         return_value=frozenset({ProviderModelInfo("one")})
     )
 
-    async def construct(provider_id, _settings, _admission_registry):
+    async def construct(
+        provider_id,
+        _settings,
+        _admission_registry,
+        _api_key_number,
+        _history_cache=None,
+    ):
         return slow if provider_id == "groq" else fast
 
     manager = ProviderRuntimeManager(
         _settings(),
-        runtime_factory=lambda settings, admission_registry: ProviderRuntime(
-            settings,
-            admission_registry,
-            provider_constructor=construct,
+        runtime_factory=lambda settings, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                settings,
+                admission_registry,
+                provider_constructor=construct,
+            )
         ),
     )
     manager.start_model_list_refresh()
@@ -157,7 +175,9 @@ async def test_failed_discovery_construction_recovers_in_same_generation(refresh
     )
     attempts = 0
 
-    async def construct(_id, _settings, _admission_registry):
+    async def construct(
+        _id, _settings, _admission_registry, _api_key_number, _history_cache=None
+    ):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -166,10 +186,12 @@ async def test_failed_discovery_construction_recovers_in_same_generation(refresh
 
     manager = ProviderRuntimeManager(
         _settings(),
-        runtime_factory=lambda settings, admission_registry: ProviderRuntime(
-            settings,
-            admission_registry,
-            provider_constructor=construct,
+        runtime_factory=lambda settings, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                settings,
+                admission_registry,
+                provider_constructor=construct,
+            )
         ),
     )
     generation = manager.current_generation_id
@@ -199,7 +221,9 @@ async def test_recovery_wait_uses_remaining_budget_without_orphaning_waiter(
     attempts = 0
     construction = None
 
-    async def construct(_id, _settings, _admission_registry):
+    async def construct(
+        _id, _settings, _admission_registry, _api_key_number, _history_cache=None
+    ):
         nonlocal attempts, construction
         attempts += 1
         if attempts == 1:
@@ -211,10 +235,12 @@ async def test_recovery_wait_uses_remaining_budget_without_orphaning_waiter(
 
     manager = ProviderRuntimeManager(
         _settings(),
-        runtime_factory=lambda settings, admission_registry: ProviderRuntime(
-            settings,
-            admission_registry,
-            provider_constructor=construct,
+        runtime_factory=lambda settings, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                settings,
+                admission_registry,
+                provider_constructor=construct,
+            )
         ),
     )
     wait = InitializationWait(1 if cancel else 0.01)
@@ -277,7 +303,7 @@ async def test_late_retired_discovery_cannot_replace_current_metadata():
     entered, release = asyncio.Event(), asyncio.Event()
     providers = []
 
-    def factory(settings, admission_registry):
+    def factory(settings, admission_registry, history_cache=None):
         provider = MagicMock(spec=BaseProvider)
         providers.append(provider)
         ordinal = len(providers)
@@ -290,7 +316,13 @@ async def test_late_retired_discovery_cannot_replace_current_metadata():
 
         provider.list_model_infos = AsyncMock(side_effect=models)
 
-        async def construct(_provider_id, _settings, _admission_registry):
+        async def construct(
+            _provider_id,
+            _settings,
+            _admission_registry,
+            _api_key_number,
+            _history_cache=None,
+        ):
             return provider
 
         return ProviderRuntime(
@@ -323,7 +355,7 @@ async def test_late_retired_discovery_cannot_replace_current_metadata():
 
 
 @pytest.mark.asyncio
-async def test_complete_catalog_publication_preserves_prior_file_until_all_attempts(
+async def test_catalog_publication_exposes_configured_models_before_discovery(
     tmp_path,
 ):
     entered, release = asyncio.Event(), asyncio.Event()
@@ -338,43 +370,50 @@ async def test_complete_catalog_publication_preserves_prior_file_until_all_attem
 
     provider.list_model_infos = AsyncMock(side_effect=models)
 
-    async def construct(_provider_id, _settings, _admission_registry):
+    async def construct(
+        _provider_id,
+        _settings,
+        _admission_registry,
+        _api_key_number,
+        _history_cache=None,
+    ):
         return provider
 
     manager = ProviderRuntimeManager(
         _settings(),
-        runtime_factory=lambda settings, admission_registry: ProviderRuntime(
-            settings,
-            admission_registry,
-            provider_constructor=construct,
+        runtime_factory=lambda settings, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                settings,
+                admission_registry,
+                provider_constructor=construct,
+            )
         ),
         model_catalog_publisher=CodexModelCatalogPublisher(path),
     )
-    waiter = asyncio.create_task(manager.wait_for_catalog())
+    manager.start_model_list_refresh()
     try:
         await entered.wait()
-        assert not waiter.done()
-        assert path.read_text(encoding="utf-8") == "prior complete catalog"
+        await manager.wait_for_catalog_file(InitializationWait())
+        assert "nvidia_nim/one" in path.read_text(encoding="utf-8")
+        assert "new-model" not in path.read_text(encoding="utf-8")
         release.set()
-        catalog = await waiter
+        await finish_discovery(manager)
+        await manager.wait_for_catalog_file(InitializationWait())
+        catalog = manager.catalog_snapshot()
         assert catalog.cached_model_info("nvidia_nim", "new-model") is not None
         assert "new-model" in path.read_text(encoding="utf-8")
     finally:
         release.set()
-        await asyncio.gather(waiter, return_exceptions=True)
         await manager.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retained_request", [False, True])
-@pytest.mark.parametrize("catalog_file", [False, True])
-async def test_catalog_wait_follows_replacement(
-    tmp_path, retained_request, catalog_file
-):
+async def test_catalog_wait_follows_replacement(tmp_path, retained_request):
     entered, release = asyncio.Event(), asyncio.Event()
     count = 0
 
-    def runtime(settings, admission_registry):
+    def runtime(settings, admission_registry, history_cache=None):
         nonlocal count
         count += 1
         old = count == 1
@@ -388,7 +427,9 @@ async def test_catalog_wait_follows_replacement(
 
         provider.list_model_infos = AsyncMock(side_effect=models)
 
-        async def construct(_id, _settings, _admission_registry):
+        async def construct(
+            _id, _settings, _admission_registry, _api_key_number, _history_cache=None
+        ):
             return provider
 
         return ProviderRuntime(
@@ -407,25 +448,14 @@ async def test_catalog_wait_follows_replacement(
     request = (
         asyncio.create_task(lease.resolve_provider("nvidia_nim")) if lease else None
     )
-    waiting = asyncio.create_task(
-        manager.wait_for_catalog_file(InitializationWait())
-        if catalog_file
-        else manager.wait_for_catalog()
-    )
+    waiting = asyncio.create_task(manager.wait_for_model_catalog("nvidia_nim/one"))
     try:
         await entered.wait()
-        settings = _settings().model_copy(update={"model": "nvidia_nim/current"})
+        settings = _settings().model_copy(update={"proxy_auth_token": "rotated"})
         await manager.replace(settings, commit=AsyncMock())
-        await manager.wait_for_catalog()
         result = await asyncio.wait_for(asyncio.shield(waiting), 1)
-        if catalog_file:
-            assert isinstance(result, int)
-            assert result == manager.current_generation_id
-            assert "nvidia_nim/current" in path.read_text(encoding="utf-8")
-        else:
-            assert not isinstance(result, int)
-            assert result.settings is settings
-            assert result.cached_model_info("nvidia_nim", "current") is not None
+        assert result.settings is settings
+        assert result.cached_model_info("nvidia_nim", "current") is not None
         if request is not None:
             assert lease is not None
             assert not request.done()
@@ -444,11 +474,8 @@ async def test_catalog_wait_follows_replacement(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("catalog_file", [False, True])
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_catalog_waiter_exit_preserves_shared_discovery(
-    monkeypatch, catalog_file, cancel
-):
+async def test_catalog_waiter_exit_preserves_shared_discovery(monkeypatch, cancel):
     existing_tasks = asyncio.all_tasks()
     entered, release = asyncio.Event(), asyncio.Event()
     provider = MagicMock(spec=BaseProvider)
@@ -460,26 +487,26 @@ async def test_catalog_waiter_exit_preserves_shared_discovery(
 
     provider.list_model_infos = AsyncMock(side_effect=models)
 
-    async def construct(_id, _settings, _admission_registry):
+    async def construct(
+        _id, _settings, _admission_registry, _api_key_number, _history_cache=None
+    ):
         return provider
 
     manager = ProviderRuntimeManager(
         _settings(),
-        runtime_factory=lambda settings, admission_registry: ProviderRuntime(
-            settings,
-            admission_registry,
-            provider_constructor=construct,
+        runtime_factory=lambda settings, admission_registry, history_cache=None: (
+            ProviderRuntime(
+                settings,
+                admission_registry,
+                provider_constructor=construct,
+            )
         ),
     )
     wait = InitializationWait(1 if cancel else 0.01)
     monkeypatch.setattr(
         "free_claude_code.runtime.provider_manager.InitializationWait", lambda: wait
     )
-    waiting = asyncio.create_task(
-        manager.wait_for_catalog_file(wait)
-        if catalog_file
-        else manager.wait_for_catalog()
-    )
+    waiting = asyncio.create_task(manager.wait_for_model_catalog("nvidia_nim/one"))
     try:
         await entered.wait()
         if cancel:
@@ -494,7 +521,7 @@ async def test_catalog_waiter_exit_preserves_shared_discovery(
             InitializationWait,
         )
         release.set()
-        snapshot = await manager.wait_for_catalog()
+        snapshot = await manager.wait_for_model_catalog("nvidia_nim/one")
         assert snapshot.cached_model_info("nvidia_nim", "one") is not None
     finally:
         release.set()

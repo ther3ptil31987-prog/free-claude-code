@@ -73,7 +73,7 @@ def test_configuration_defaults_and_region_override():
     config = build_provider_config(descriptor, settings)
     assert config.api_key == "key"
     assert config.base_url == BASE_URL
-    assert descriptor.configuration_attrs() == ("alibaba_cloud_api_key",)
+    assert descriptor.configuration_attrs() == ("alibaba_cloud_api_keys",)
 
     settings = Settings(
         ALIBABA_CLOUD_API_KEY="regional-key",
@@ -344,7 +344,7 @@ async def test_chat_stream_preserves_reasoning_tools_and_usage(wire):
                 )
             )
         )
-        output = "".join([event async for event in stream])
+        output = "".join([frame async for event in stream for frame in event.frames])
 
     assert len(requests) == 1
     assert requests[0].url.path == "/compatible-mode/v1/chat/completions"

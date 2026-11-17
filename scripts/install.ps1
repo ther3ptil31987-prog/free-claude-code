@@ -1,8 +1,9 @@
 param(
     [switch] $VoiceLocal,
     [string] $TorchBackend = "",
-    [switch] $Rtk,
+    [switch] $RtkHeadroom,
     [switch] $DryRun,
+    [switch] $Update,
     [switch] $Help,
     [Parameter(ValueFromRemainingArguments = $true)]
     [object[]] $RemainingArgs = @()
@@ -12,19 +13,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# Windows on ARM emulates x64, whose Python package ecosystem has broader wheel support.
-$PythonRequest = "cpython-3.14.7-windows-x86_64-none"
-$MinUvVersion = "0.12.13"
+# Filled from the selected release before installation; placeholders are for dry-run.
+$PythonRequest = "<release-python>"
+$MinUvVersion = "<release-uv-minimum>"
 $ClaudeInstallUrl = "https://claude.ai/install.ps1"
 $CodexInstallUrl = "https://chatgpt.com/codex/install.ps1"
 $PiInstallUrl = "https://pi.dev/install.ps1"
 $OpenCodeReleaseBaseUrl = "https://opencode.ai/files/bin"
+$script:OriginalOpenCodeSearchPath = ""
 $HermesInstallUrl = "https://hermes-agent.nousresearch.com/install.ps1"
 $DshMinimumVersion = "0.2.0-rc.2"
 $DshPackage = "@deepseek-ai/dsh@latest"
 $GrokInstallUrl = "https://x.ai/cli/install.ps1"
 $MuseInstallUrl = "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install-muse.ps1"
+$AgyInstallUrl = "https://antigravity.google/cli/install.ps1"
+$AgyMinimumVersion = "1.5.9"
 $RtkVersion = "0.44.2"
+$HeadroomPackage = "headroom-ai[mcp]==0.40.0"
 $RtkReleaseBaseUrl = "https://github.com/rtk-ai/rtk/releases/download/v$RtkVersion"
 $RtkWindowsAssetName = "rtk-x86_64-pc-windows-msvc.zip"
 $RtkWindowsAssetSha256 = "3a1e114edce9080f8a10663e9c87488363a82f14a5ca8aab2ad416817f89d47c"
@@ -39,9 +44,12 @@ $script:InstallDsh = $true
 $script:InstallGrok = $true
 $script:InstallMuse = $true
 $script:InstallAider = $true
+$script:InstallAgy = $true
 $script:PiAvailable = $false
 $script:MuseAvailable = $false
-$script:EnableRtk = $Rtk.IsPresent
+$script:EnableRtkHeadroom = $RtkHeadroom.IsPresent
+$FccInstallVersion = [Environment]::GetEnvironmentVariable("FCC_INSTALL_VERSION")
+$FccReleasePattern = '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z'
 $script:InstallLog = ""
 $script:InstallLogWarning = $false
 $script:InstallSteps = [ordered] @{}
@@ -52,6 +60,7 @@ $script:InstallStageNumber = 0
 $script:InstallStageCount = 0
 $script:FccVerified = $false
 $script:DesktopReady = $false
+$script:HeadroomPath = ""
 $FccCommands = @(
     # Include retired entry points so updates reject older FCC processes before replacement.
     "fcc-desktop",
@@ -66,6 +75,7 @@ $FccCommands = @(
     "fcc-grok",
     "fcc-muse",
     "fcc-aider",
+    "fcc-agy",
     "fcc-doctor",
     "fcc-update",
     "fcc-init",
@@ -81,7 +91,8 @@ Installs or updates Free Claude Code and lets you choose which coding agents to 
 Options:
   -VoiceLocal            Install local Whisper voice transcription support.
   -TorchBackend VALUE    Use a uv PyTorch backend, such as cu130. Requires local voice.
-  -Rtk                   Install and configure RTK for the selected coding agents.
+  -RtkHeadroom           Install and configure RTK + Headroom token optimization.
+  -Update                Skip when FCC is already this release or newer.
   -DryRun                Print commands without running them.
   -Help                  Show this help text.
 "@
@@ -151,13 +162,19 @@ function Start-InstallStep {
 
 function Get-InstallerRetryCommand {
     $options = @()
+    $prefix = ""
+    $installerRef = "main"
+    if ($FccInstallVersion) {
+        $prefix = "`$env:FCC_INSTALL_VERSION = '$FccInstallVersion'; "
+        $installerRef = "v$FccInstallVersion"
+    }
     if ($VoiceLocal) { $options += "-VoiceLocal" }
     if ($TorchBackend) { $options += @("-TorchBackend", $TorchBackend) }
-    if ($script:EnableRtk) { $options += "-Rtk" }
+    if ($script:EnableRtkHeadroom) { $options += "-RtkHeadroom" }
     if ($script:InstallerPath -and (Test-Path -LiteralPath $script:InstallerPath -PathType Leaf)) {
-        return "& " + (Format-Command $script:InstallerPath $options)
+        return $prefix + "& " + (Format-Command $script:InstallerPath $options)
     }
-    return "& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/Alishahryar1/free-claude-code/main/scripts/install.ps1'))) " + (($options | ForEach-Object { Format-Argument $_ }) -join " ")
+    return $prefix + "& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/Alishahryar1/free-claude-code/$installerRef/scripts/install.ps1'))) " + (($options | ForEach-Object { Format-Argument $_ }) -join " ")
 }
 
 function Show-InstallReport {
@@ -310,24 +327,19 @@ function Select-CodingAgents {
         $script:InstallGrok = Read-CodingAgentSelection grok "Grok Build" fcc-grok
         $script:InstallMuse = Read-CodingAgentSelection muse "Muse Code" fcc-muse
         $script:InstallAider = Read-CodingAgentSelection aider Aider fcc-aider
+        $script:InstallAgy = Read-CodingAgentSelection agy "Antigravity CLI" fcc-agy
 
-        if ($script:InstallClaudeCode -or $script:InstallCodex -or $script:InstallPi -or $script:InstallOpenCode -or $script:InstallCline -or $script:InstallHermes -or $script:InstallDsh -or $script:InstallGrok -or $script:InstallMuse -or $script:InstallAider) {
+        if ($script:InstallClaudeCode -or $script:InstallCodex -or $script:InstallPi -or $script:InstallOpenCode -or $script:InstallCline -or $script:InstallHermes -or $script:InstallDsh -or $script:InstallGrok -or $script:InstallMuse -or $script:InstallAider -or $script:InstallAgy) {
             break
         }
         Write-Host "Select at least one coding agent."
         Write-Host ""
     }
 
-    if (-not $script:EnableRtk) {
-        if (Get-ApplicationCommand "rtk") {
-            Write-Host "RTK already installed; will verify."
-            $script:EnableRtk = $true
-        }
-        else {
-            $script:EnableRtk = Read-YesNo `
-                -Prompt "Enable RTK token optimization globally for the selected coding agents?" `
-                -DefaultYes $false
-        }
+    if (-not $script:EnableRtkHeadroom) {
+        $script:EnableRtkHeadroom = Read-YesNo `
+            -Prompt "Enable RTK + Headroom token optimization?" `
+            -DefaultYes $false
     }
 }
 
@@ -495,6 +507,7 @@ function Add-KnownBinDirectories {
         Add-PathEntry (Join-Path $env:LOCALAPPDATA "Programs\OpenAI\Codex\bin")
         Add-PathEntry (Join-Path $env:LOCALAPPDATA "pi-node\current")
         Add-PathEntry (Join-Path $env:LOCALAPPDATA "Programs\Muse Code\bin")
+        Add-PathEntry (Join-Path $env:LOCALAPPDATA "agy\bin")
     }
     if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
         Add-PathEntry (Join-Path $env:APPDATA "npm")
@@ -796,7 +809,7 @@ function Ensure-Rtk {
 }
 
 function Configure-RtkForSelectedAgents {
-    if (-not $script:EnableRtk) {
+    if (-not $script:EnableRtkHeadroom) {
         return
     }
 
@@ -815,6 +828,55 @@ function Configure-RtkForSelectedAgents {
     }
     if ($script:InstallCline) {
         Write-Host "Optional for each project: cd <project>; `$env:RTK_TELEMETRY_DISABLED='1'; rtk init --agent cline"
+    }
+}
+
+function Ensure-Headroom {
+    $command = Get-ApplicationCommand "headroom"
+    if ($command) {
+        $script:HeadroomPath = $command.Source
+        Write-Host "Headroom already found on PATH; verifying it without updating it."
+    }
+    else {
+        Invoke-NativeCommand -FilePath "uv" -Arguments @("tool", "install", "--python", $PythonRequest, $HeadroomPackage)
+        if ($DryRun) {
+            $script:HeadroomPath = "<uv-tool-bin>\headroom.exe"
+        }
+        else {
+            $uvCommand = Get-ApplicationCommand "uv"
+            $toolBin = Add-UvToolBinDirectory -UvPath $uvCommand.Source
+            $command = Get-ApplicationCommand "headroom"
+            if (-not $command -or (Split-Path -Parent $command.Source) -ne $toolBin) {
+                throw "Headroom installation did not create its command in the uv tool bin directory."
+            }
+            $script:HeadroomPath = $command.Source
+        }
+    }
+    Invoke-NativeCommand -FilePath $script:HeadroomPath -Arguments @("--version")
+    Invoke-NativeCommand -FilePath $script:HeadroomPath -Arguments @("mcp", "install", "--help")
+}
+
+function Configure-HeadroomForSelectedAgents {
+    # Headroom 0.40.0's OpenCode registrar uses the pre-v2 schema.
+    Write-Host "Headroom setup supports Claude Code, Codex, and Grok. Other selected agents are skipped."
+    $agents = @()
+    if ($script:InstallClaudeCode) { $agents += "claude" }
+    if ($script:InstallCodex) { $agents += "codex" }
+    if ($script:InstallGrok) { $agents += "grok" }
+    if ($agents.Count -eq 0) {
+        Write-Host "Headroom registration skipped: no supported agents selected."
+        return
+    }
+    $previousPath = $env:PATH
+    try {
+        # Upstream resolves the server executable from PATH.
+        $env:PATH = (Split-Path -Parent $script:HeadroomPath) + [IO.Path]::PathSeparator + $env:PATH
+        foreach ($agent in $agents) {
+            Invoke-NativeCommand -FilePath $script:HeadroomPath -Arguments @("mcp", "install", "--agent", $agent)
+        }
+    }
+    finally {
+        $env:PATH = $previousPath
     }
 }
 
@@ -1055,29 +1117,80 @@ function Install-OpenCode {
     }
 }
 
+function Get-LatestOpenCodeV1 {
+    $metadataPath = [IO.Path]::GetTempFileName()
+    try {
+        Invoke-RestMethod -Uri "https://registry.npmjs.org/-/package/opencode-ai/dist-tags" -OutFile $metadataPath -TimeoutSec 10 -ErrorAction Stop
+        $text = [IO.File]::ReadAllText($metadataPath)
+        if ([regex]::Matches($text, '"latest"\s*:').Count -ne 1) {
+            throw "The registry must contain exactly one latest tag."
+        }
+        $version = ($text | ConvertFrom-Json -ErrorAction Stop).latest
+        if ($version -isnot [string] -or $version -notmatch '^1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or [version] $version -lt [version] "1.19.0") {
+            throw "The latest tag must be a stable v1 release at or above 1.19.0."
+        }
+        return $version
+    }
+    catch {
+        throw "Could not discover the latest OpenCode 1 release: $($_.Exception.Message) Upgrade OpenCode manually, then rerun the installer."
+    }
+    finally {
+        Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-OpenCodeUpgrade {
+    param([string] $OpenCodePath, [string] $Target)
+
+    Assert-NoOpenCodeProcessesRunning
+    $savedPath = $env:Path
+    $savedVersion = $env:VERSION
+    try {
+        $env:VERSION = $null
+        if ($script:OriginalOpenCode -and $script:OriginalOpenCodeSearchPath) {
+            # Installer-added directories must not hide a failed upgrade behind another copy.
+            $env:Path = $script:OriginalOpenCodeSearchPath
+        }
+        Invoke-NativeCommand -FilePath $OpenCodePath -Arguments @("upgrade", $Target) | Out-Host
+        $command = Get-ApplicationCommand "opencode"
+        if (-not $command) { throw "OpenCode is missing from PATH." }
+        $version = Get-OpenCodeVersion $command.Source
+        if ($Target -eq "--major" -and $version -notmatch '^2\.') {
+            throw "Found '$version' at '$($command.Source)' instead of stable OpenCode 2."
+        }
+        return [pscustomobject] @{ Command = $command; Version = $version }
+    }
+    catch {
+        throw "OpenCode upgrade $Target failed: $($_.Exception.Message) Finish the official upgrade manually, then rerun the installer."
+    }
+    finally {
+        $env:Path = $savedPath
+        $env:VERSION = $savedVersion
+    }
+}
+
 function Get-OpenCodeInstallState {
     $command = if ($script:OriginalOpenCode) { $script:OriginalOpenCode } else { Get-ApplicationCommand "opencode" }
     $nativePath = Join-Path $env:USERPROFILE ".opencode\bin\opencode.exe"
-    $install = $true
+    $action = "install"
+    $version = ""
     if ($command) {
         $version = Get-OpenCodeVersion $command.Source
         if ($version -match '^2\.') {
-            $install = $false
+            $action = "reuse"
         }
         elseif ($version -match '^1\.') {
-            if (-not (Test-EquivalentPath $command.Source $nativePath)) {
-                throw "OpenCode 1 at '$($command.Source)' requires manual migration. Remove it with its package manager (npm: npm uninstall -g opencode-ai), then rerun this installer. See https://opencode.ai/v2/docs/migrate-v1/"
-            }
+            $action = "upgrade"
         }
         else {
             throw "OpenCode at '$($command.Source)' is not a recognized stable v1 or v2. Correct that installation, then rerun the installer. See https://opencode.ai/v2/docs/migrate-v1/"
         }
     }
     $pluginPath = Get-OpenCodeRtkPlugin
-    if ($install -or $pluginPath) {
+    if ($action -ne "reuse" -or $pluginPath) {
         Assert-NoOpenCodeProcessesRunning
     }
-    if ($install) {
+    if ($action -eq "install") {
         foreach ($target in @((Join-Path $env:USERPROFILE ".opencode"), (Split-Path -Parent $nativePath), $nativePath)) {
             $item = Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
             if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -1085,7 +1198,7 @@ function Get-OpenCodeInstallState {
             }
         }
     }
-    return [pscustomobject] @{ Install = $install; PluginPath = $pluginPath }
+    return [pscustomobject] @{ Action = $action; Command = $command; Version = $version; PluginPath = $pluginPath }
 }
 
 function Ensure-OpenCode {
@@ -1093,7 +1206,9 @@ function Ensure-OpenCode {
     $nativePath = Join-Path $env:USERPROFILE ".opencode\bin\opencode.exe"
     if ($DryRun) {
         Write-Host "+ opencode --version"
-        Write-Host "Install stable OpenCode 2 if absent, or migrate v1 at '$nativePath'; external v1 requires manual upgrade."
+        Write-Host "Install stable OpenCode 2 if absent; retain stable v2."
+        Write-Host "For v1 below 1.19.0: discover latest stable v1 and run opencode upgrade <latest-v1>, then verify."
+        Write-Host "For remaining stable v1 at or above 1.19.0: run opencode upgrade --major, then verify stable v2."
         Write-Host "Check and back up the recognized old OpenCode RTK plugin if present."
         if (-not $command) { Install-OpenCode }
         return
@@ -1101,11 +1216,27 @@ function Ensure-OpenCode {
 
     $state = Get-OpenCodeInstallState
     $pluginPath = $state.PluginPath
-    if ($state.Install) {
+    if ($state.Action -eq "install") {
         Install-OpenCode
         Add-KnownBinDirectories
         if ((Get-OpenCodeVersion $nativePath) -notmatch '^2\.') {
             throw "The OpenCode installer did not install stable OpenCode 2 at '$nativePath'."
+        }
+    }
+    elseif ($state.Action -eq "upgrade") {
+        $command = $state.Command
+        $version = $state.Version
+        if ([version] ($version -replace '\+.*$', '') -lt [version] "1.19.0") {
+            $target = Get-LatestOpenCodeV1
+            $upgraded = Invoke-OpenCodeUpgrade -OpenCodePath $command.Source -Target $target
+            $command = $upgraded.Command
+            $version = $upgraded.Version
+            if ($version -notmatch '^2\.' -and ($version -replace '\+.*$', '') -ne $target) {
+                throw "OpenCode upgrade $target left '$version' at '$($command.Source)'. Finish the official upgrade manually, then rerun the installer."
+            }
+        }
+        if ($version -match '^1\.') {
+            $null = Invoke-OpenCodeUpgrade -OpenCodePath $command.Source -Target "--major"
         }
     }
     else {
@@ -1116,7 +1247,7 @@ function Ensure-OpenCode {
     if (-not $command) { throw "OpenCode is not available on PATH after installation." }
     $version = Get-OpenCodeVersion $command.Source
     if ($version -notmatch '^2\.') {
-        throw "OpenCode at '$($command.Source)' is not stable OpenCode 2. Correct PATH, then rerun the installer."
+        throw "OpenCode at '$($command.Source)' is not stable OpenCode 2 (found '$version'). Correct PATH or finish the official upgrade manually, then rerun the installer."
     }
     Write-Host "Verified OpenCode $version at '$($command.Source)'."
     if ($pluginPath) {
@@ -1200,6 +1331,59 @@ function Ensure-Grok {
     }
 
     Confirm-Application -CommandName "grok" -DisplayName "Grok Build"
+}
+
+function Get-AgyVersion {
+    param([string] $AgyPath)
+
+    $output = Invoke-Utf8NativeCapture -FilePath $AgyPath -Arguments @("--version")
+    if ($output -notmatch '^\s*(?<version>\d+\.\d+\.\d+(?:\+[0-9A-Za-z.-]+)?)\s*$') {
+        throw "Antigravity CLI is present, but 'agy --version' did not return a stable semantic version."
+    }
+    return $Matches['version']
+}
+
+function Ensure-Agy {
+    Add-KnownBinDirectories
+    $command = Get-ApplicationCommand "agy"
+    if ($DryRun) {
+        if ($command) {
+            Write-Host "+ agy --version"
+            Write-Host "Antigravity CLI >=$AgyMinimumVersion will be preserved; an older version will be upgraded with agy update."
+        }
+        else {
+            Invoke-DownloadedPowerShellInstaller -Url $AgyInstallUrl -Name "Antigravity CLI"
+            Write-Host "+ agy --version"
+        }
+        return
+    }
+    if ($command) {
+        $version = Get-AgyVersion $command.Source
+        if (Test-SupportedStableVersion $version $AgyMinimumVersion) {
+            $script:InstallStepOutcome = "Reused"
+            Write-Host "Antigravity CLI $version already satisfies >=$AgyMinimumVersion; leaving it unchanged."
+            return
+        }
+    }
+    if (@(Get-Process -Name agy -ErrorAction SilentlyContinue).Count -gt 0) {
+        throw "Close Antigravity CLI before replacing its executable, then rerun the installer."
+    }
+    if ($command) {
+        Invoke-NativeCommand -FilePath $command.Source -Arguments @("update")
+    }
+    else {
+        Invoke-DownloadedPowerShellInstaller -Url $AgyInstallUrl -Name "Antigravity CLI"
+        Add-KnownBinDirectories
+    }
+    $command = Get-ApplicationCommand "agy"
+    if (-not $command) {
+        throw "Antigravity CLI was installed, but 'agy' is not available on PATH."
+    }
+    $version = Get-AgyVersion $command.Source
+    if (-not (Test-SupportedStableVersion $version $AgyMinimumVersion)) {
+        throw "Antigravity CLI requires >=$AgyMinimumVersion; found $version after installation."
+    }
+    Write-Host "Verified Antigravity CLI $version."
 }
 
 function Install-Aider {
@@ -1448,7 +1632,7 @@ function Confirm-SelectedPrerequisites {
     if ($script:InstallHermes -and -not (Get-ApplicationCommand "hermes")) { Confirm-HermesArchitecture }
     if ($script:InstallOpenCode) {
         $state = Get-OpenCodeInstallState
-        if ($state.Install) { [void] (Get-OpenCodeWindowsAssetName) }
+        if ($state.Action -eq "install") { [void] (Get-OpenCodeWindowsAssetName) }
     }
 }
 
@@ -1503,7 +1687,12 @@ function Ensure-SelectedCodingAgents {
         Ensure-Aider
     }
 
-    if ((-not $script:InstallClaudeCode) -and (-not $script:InstallCodex) -and (-not $script:PiAvailable) -and (-not $script:InstallOpenCode) -and (-not $script:InstallCline) -and (-not $script:InstallHermes) -and (-not $script:InstallDsh) -and (-not $script:InstallGrok) -and (-not $script:MuseAvailable) -and (-not $script:InstallAider)) {
+    if ($script:InstallAgy) {
+        Start-InstallStep "Antigravity CLI" "Ensuring Antigravity CLI is installed"
+        Ensure-Agy
+    }
+
+    if ((-not $script:InstallClaudeCode) -and (-not $script:InstallCodex) -and (-not $script:PiAvailable) -and (-not $script:InstallOpenCode) -and (-not $script:InstallCline) -and (-not $script:InstallHermes) -and (-not $script:InstallDsh) -and (-not $script:InstallGrok) -and (-not $script:MuseAvailable) -and (-not $script:InstallAider) -and (-not $script:InstallAgy)) {
         throw "No selected coding agent was installed. Re-run the installer and choose at least one."
     }
 }
@@ -1611,10 +1800,10 @@ function Ensure-Uv {
 }
 
 function Get-PackageSpec {
-    if ($VoiceLocal) {
-        return "free-claude-code[voice_local]"
-    }
-    return "free-claude-code"
+    $spec = if ($VoiceLocal) { "free-claude-code[voice_local]" } else { "free-claude-code" }
+    if ($FccInstallVersion) { $spec += "==$FccInstallVersion" }
+    elseif ($DryRun) { $spec += "==<selected-release>" }
+    return $spec
 }
 
 function Install-FreeClaudeCode {
@@ -1685,7 +1874,7 @@ function Configure-AndConfirmFreeClaudeCode {
     if ($DryRun) {
         Write-Host "+ uv tool update-shell"
         Write-Host "+ uv tool dir --bin"
-        Write-Host "+ verify fcc-desktop, fcc-server, fcc-claude, fcc-codex, fcc-pi, fcc-opencode, fcc-cline, fcc-hermes, fcc-dsh, fcc-grok, fcc-muse, and fcc-aider in the uv tool bin directory"
+        Write-Host "+ verify fcc-desktop, fcc-server, fcc-claude, fcc-codex, fcc-pi, fcc-opencode, fcc-cline, fcc-hermes, fcc-dsh, fcc-grok, fcc-muse, fcc-aider, and fcc-agy in the uv tool bin directory"
         Write-Host "+ fcc-server --version"
         Export-FccDesktopIcon `
             -DesktopCommand "<uv-tool-bin>\fcc-desktop.exe" `
@@ -1708,7 +1897,7 @@ function Configure-AndConfirmFreeClaudeCode {
         [IO.Path]::AltDirectorySeparatorChar
     )
     $installedCommands = @{}
-    foreach ($commandName in @("fcc-desktop", "fcc-server", "fcc-claude", "fcc-codex", "fcc-pi", "fcc-opencode", "fcc-cline", "fcc-hermes", "fcc-dsh", "fcc-grok", "fcc-muse", "fcc-aider", "fcc-doctor", "fcc-update.cmd")) {
+    foreach ($commandName in @("fcc-desktop", "fcc-server", "fcc-claude", "fcc-codex", "fcc-pi", "fcc-opencode", "fcc-cline", "fcc-hermes", "fcc-dsh", "fcc-grok", "fcc-muse", "fcc-aider", "fcc-agy", "fcc-doctor", "fcc-update.cmd")) {
         $command = Get-ApplicationCommand $commandName
         if (-not $command) {
             throw "Free Claude Code installation did not create '$commandName'."
@@ -1835,7 +2024,154 @@ function Show-InstallerNextSteps {
     if ($script:InstallAider) {
         Write-Host "Run Aider with: fcc-aider"
     }
+    if ($script:InstallAgy) {
+        Write-Host "Run Antigravity CLI with: fcc-agy"
+    }
 
+}
+
+function Get-InstalledFccVersion {
+    # Look where uv usually lives without changing the PATH the installer preserves.
+    $originalPath = $env:Path
+    $originalErrorPreference = $ErrorActionPreference
+    try {
+        Add-KnownBinDirectories
+        $uv = Get-ApplicationCommand "uv"
+        if (-not $uv) { return $null }
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = $null
+        $listing = @(& $uv.Source tool list 2>$null)
+        if ($LASTEXITCODE -ne 0) { return $null }
+        foreach ($line in $listing) {
+            if ("$line" -cmatch '\Afree-claude-code v(\S+)') { return $Matches[1] }
+        }
+        return $null
+    }
+    catch { return $null }
+    finally {
+        $ErrorActionPreference = $originalErrorPreference
+        $env:Path = $originalPath
+    }
+}
+
+function Compare-FccVersions {
+    # Returns older, current, or newer for an installed version against a release.
+    param([string] $Installed, [string] $Release)
+
+    $pattern = '\A(\d+)\.(\d+)\.(\d+)(.*)\z'
+    if ($Release -cnotmatch $pattern -or $Matches[4]) { return $null }
+    $releaseParts = @([Numerics.BigInteger]::Parse($Matches[1]), [Numerics.BigInteger]::Parse($Matches[2]), [Numerics.BigInteger]::Parse($Matches[3]))
+    if ($Installed -cnotmatch $pattern) { return $null }
+    $installedParts = @([Numerics.BigInteger]::Parse($Matches[1]), [Numerics.BigInteger]::Parse($Matches[2]), [Numerics.BigInteger]::Parse($Matches[3]))
+    $suffix = $Matches[4]
+    for ($i = 0; $i -lt 3; $i++) {
+        if ($installedParts[$i] -gt $releaseParts[$i]) { return "newer" }
+        if ($installedParts[$i] -lt $releaseParts[$i]) { return "older" }
+    }
+    # Local and post builds follow the release; dev and pre-releases precede it.
+    if (-not $suffix) { return "current" }
+    if ($suffix -cmatch '\A(\+|\.post)') { return "newer" }
+    return "older"
+}
+
+function Test-FccUpdateNeeded {
+    $installed = Get-InstalledFccVersion
+    if (-not $installed) { return $true }
+    $comparison = Compare-FccVersions -Installed $installed -Release $FccInstallVersion
+    if ($comparison -eq "current") {
+        Write-Host "FCC $installed is already up to date."
+        return $false
+    }
+    if ($comparison -eq "newer") {
+        Write-Host "FCC $installed is newer than the published version $FccInstallVersion. No update needed."
+        return $false
+    }
+    if ($comparison -eq "older") {
+        Write-Host "FCC update available: $installed -> $FccInstallVersion."
+    }
+    return $true
+}
+
+function Invoke-SelectedReleaseInstaller {
+    param([hashtable] $InstallerArguments)
+
+    try {
+        if (-not $FccInstallVersion) {
+            $releaseBase = "https://github.com/Alishahryar1/free-claude-code/releases"
+            $response = Invoke-WebRequest -Uri "$releaseBase/latest" -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 5
+            $selectedUrl = if ($response.BaseResponse.PSObject.Properties['ResponseUri']) {
+                $response.BaseResponse.ResponseUri.AbsoluteUri
+            } else { $response.BaseResponse.RequestMessage.RequestUri.AbsoluteUri }
+            $prefix = "$releaseBase/tag/v"
+            if (-not $selectedUrl.StartsWith($prefix, [StringComparison]::Ordinal)) { throw "GitHub returned an unexpected FCC release URL." }
+            $FccInstallVersion = $selectedUrl.Substring($prefix.Length)
+            if ($FccInstallVersion -cnotmatch $FccReleasePattern) { throw "GitHub did not return a canonical FCC release version." }
+        }
+        $text = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/v$FccInstallVersion/scripts/install.ps1" -TimeoutSec 10 -MaximumRedirection 5
+        if ($text -isnot [string] -or [string]::IsNullOrWhiteSpace($text)) { throw "The installer for FCC $FccInstallVersion was empty or invalid." }
+        $installer = [scriptblock]::Create($text)
+    } catch {
+        Write-Host "Retry: $(Get-InstallerRetryCommand)"
+        throw
+    }
+    $previousContext = @{}
+    foreach ($name in @('FCC_INSTALL_VERSION', '_FCC_INSTALLER_RELEASE')) {
+        $previousContext[$name] = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    }
+    try {
+        $env:FCC_INSTALL_VERSION = $FccInstallVersion
+        $env:_FCC_INSTALLER_RELEASE = $FccInstallVersion
+        & $installer @InstallerArguments
+    } finally {
+        foreach ($name in $previousContext.Keys) {
+            if ($null -ne $previousContext[$name]) { Set-Item -LiteralPath "Env:$name" -Value $previousContext[$name].Value }
+            else { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Read-ToolchainRequirements {
+    param([string] $Text)
+
+    $section = ""
+    $sections = @{}
+    $values = @{}
+    $number = '(0|[1-9][0-9]*)'
+    $version = "$number\.$number\.$number"
+    foreach ($rawLine in ($Text -split "`n")) {
+        $line = $rawLine.Trim()
+        if ($line.StartsWith('[')) {
+            $section = ""
+            if ($line -cmatch '^\[project\]\s*(#.*)?$') { $section = "project" }
+            if ($line -cmatch '^\[tool\.uv\]\s*(#.*)?$') { $section = "uv" }
+            if ($section) {
+                if ($sections.ContainsKey($section)) { throw "Duplicate toolchain table." }
+                $sections[$section] = $true
+            }
+            continue
+        }
+        if (($section -eq "project" -and $line -cmatch '^requires-python\s*=') -or
+            ($section -eq "uv" -and $line -cmatch '^required-version\s*=')) {
+            if ($values.ContainsKey($section)) { throw "Duplicate toolchain requirement." }
+            $value = ($line -split '=', 2)[1].TrimStart()
+            $operator = if ($section -eq "project") { "==" } else { ">=" }
+            if ($value -cnotmatch ('^(?<quote>["''])' + $operator + '(?<version>' + $version + ')\k<quote>\s*(#.*)?$')) {
+                throw "Invalid $section toolchain requirement."
+            }
+            $values[$section] = $Matches.version
+        }
+    }
+    if (-not $values.ContainsKey("project") -or -not $values.ContainsKey("uv")) {
+        throw "Missing Python or uv requirement in pyproject.toml."
+    }
+    return @{ Python = $values.project; Uv = $values.uv }
+}
+
+function Get-ReleaseToolchain {
+    $metadataUrl = "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/v$FccInstallVersion/pyproject.toml"
+    $text = Invoke-RestMethod -Uri $metadataUrl -TimeoutSec 10 -MaximumRedirection 5 -ErrorAction Stop
+    if ($text -isnot [string]) { throw "Invalid pyproject.toml response for FCC $FccInstallVersion." }
+    return Read-ToolchainRequirements -Text $text
 }
 
 if ($Help) {
@@ -1848,10 +2184,40 @@ if ($RemainingArgs.Count -gt 0) {
     throw "Unknown option: $($RemainingArgs -join ' ')"
 }
 
+if ($FccInstallVersion -and $FccInstallVersion -cnotmatch $FccReleasePattern) {
+    throw "FCC_INSTALL_VERSION must be a canonical major.minor.patch release."
+}
+
 if ((-not [string]::IsNullOrWhiteSpace($TorchBackend)) -and (-not $VoiceLocal)) {
     throw "-TorchBackend requires -VoiceLocal."
 }
 
+if (-not $DryRun) {
+    # A public pin requests a release; only the consumed marker skips dispatch.
+    $installerRelease = [Environment]::GetEnvironmentVariable("_FCC_INSTALLER_RELEASE")
+    if ($installerRelease -and $installerRelease -cne $FccInstallVersion) { throw "Invalid FCC release handoff." }
+    Remove-Item Env:_FCC_INSTALLER_RELEASE -ErrorAction SilentlyContinue
+    if (-not $installerRelease) {
+        $installerParameters = @{} + $PSBoundParameters
+        Invoke-SelectedReleaseInstaller -InstallerArguments $installerParameters
+        return
+    }
+    if ($Update -and -not (Test-FccUpdateNeeded)) {
+        return
+    }
+    try {
+        $requirements = Get-ReleaseToolchain
+    } catch {
+        if ($FccInstallVersion) {
+            Write-Host "Could not load toolchain requirements for FCC $FccInstallVersion."
+            Write-Host "Retry: $(Get-InstallerRetryCommand)"
+        }
+        throw
+    }
+    # Windows on ARM emulates x64 for broader Python wheel support.
+    $PythonRequest = "cpython-$($requirements.Python)-windows-x86_64-none"
+    $MinUvVersion = $requirements.Uv
+}
 Initialize-InstallLog
 $script:InstallSteps["Preflight"] = "Not attempted"
 $installSucceeded = $false
@@ -1860,6 +2226,7 @@ try {
     Start-InstallStep "Preflight"
     # Preserve the user's winning command before adding installer search paths.
     $script:OriginalOpenCode = Get-ApplicationCommand "opencode"
+    $script:OriginalOpenCodeSearchPath = $env:Path
     Add-KnownBinDirectories
     $script:InstallCline = [bool] ((Get-ApplicationCommand "cline") -or (Get-ApplicationCommand "npm"))
     Write-Step "Checking for running Free Claude Code processes"
@@ -1887,7 +2254,8 @@ try {
         @("Pi", $script:InstallPi), @("OpenCode", $script:InstallOpenCode),
         @("Cline", $script:InstallCline), @("Hermes", $script:InstallHermes),
         @("DeepSeek Harness", $script:InstallDsh), @("Grok", $script:InstallGrok),
-        @("Muse", $script:InstallMuse), @("Aider", $script:InstallAider)
+        @("Muse", $script:InstallMuse), @("Aider", $script:InstallAider),
+        @("Antigravity CLI", $script:InstallAgy)
     )) {
         if ($choice[1]) {
             $script:InstallSteps[$choice[0]] = "Not attempted"
@@ -1897,14 +2265,18 @@ try {
     foreach ($name in @("FCC package", "PATH configuration", "FCC verification", "Desktop integration")) {
         $script:InstallSteps[$name] = "Not attempted"
     }
-    if ($script:EnableRtk) { $script:InstallSteps["RTK configuration"] = "Not attempted" }
+    if ($script:EnableRtkHeadroom) {
+        $script:InstallSteps["Headroom verification"] = "Not attempted"
+        $script:InstallSteps["RTK configuration"] = "Not attempted"
+        $script:InstallSteps["Headroom configuration"] = "Not attempted"
+    }
 
     Write-Host "`nInstallation plan:"
     Write-Host "  Install or update Free Claude Code."
     Write-Host "  Verify or install: $($selectedAgents -join ', ')."
     if ($VoiceLocal) { Write-Host "  Include local voice support." }
     if ($TorchBackend) { Write-Host "  PyTorch backend: $TorchBackend" }
-    if ($script:EnableRtk) { Write-Host "  Configure RTK for the selected agents." }
+    if ($script:EnableRtkHeadroom) { Write-Host "  Run RTK + Headroom setup for supported selected agents." }
     Write-Host "Press Ctrl+C to cancel. You can rerun the installer afterward."
     $script:InstallStageCount = $script:InstallSteps.Count - 1
 
@@ -1920,9 +2292,13 @@ try {
 
     Configure-AndConfirmFreeClaudeCode
 
-    if ($script:EnableRtk) {
+    if ($script:EnableRtkHeadroom) {
+        Start-InstallStep "Headroom verification"
+        Ensure-Headroom
         Start-InstallStep "RTK configuration"
         Configure-RtkForSelectedAgents
+        Start-InstallStep "Headroom configuration"
+        Configure-HeadroomForSelectedAgents
     }
     Complete-InstallStep
     $installSucceeded = $true

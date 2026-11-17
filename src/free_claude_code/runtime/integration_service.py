@@ -27,6 +27,7 @@ from free_claude_code.core.json_types import JsonObject
 from free_claude_code.harnesses import (
     claude_desktop_integration,
     claude_integration,
+    claude_onboarding,
     codex_integration,
     dsh_desktop_integration,
     jetbrains_acp_integration,
@@ -62,12 +63,12 @@ class IntegrationService:
         self,
         provider_manager: ProviderRuntimeManager,
         *,
-        config_lock: asyncio.Lock,
+        config_publication: AsyncReadWriteLock,
         is_draining: Callable[[], bool],
         has_pending_restart: Callable[[], bool],
     ) -> None:
         self.provider_manager = provider_manager
-        self._config_lock = config_lock
+        self._config_publication = config_publication
         self._is_draining = is_draining
         self._has_pending_restart = has_pending_restart
         self._claude_update = _IntegrationUpdate()
@@ -215,13 +216,11 @@ class IntegrationService:
 
         def status_reader() -> Callable[[str, str, bool], JsonObject]:
             catalog = read_model_catalog(self.provider_manager)
-            timeout = self.settings.provider_progress_timeout
             return lambda url, token, ready: dsh_desktop_integration.status(
                 dsh_desktop_integration.config_home(),
                 url,
                 token,
                 catalog,
-                provider_progress_timeout=timeout,
             )
 
         def disconnect(url: str, token: str, ready: bool) -> JsonObject:
@@ -260,9 +259,12 @@ class IntegrationService:
                 if not current["connected"]:
                     return {"changed": False}
             while True:
-                snapshot = await self.provider_manager.wait_for_catalog()
+                snapshot = self.provider_manager.catalog_snapshot()
                 revision = self.provider_manager.catalog_status()["catalog_revision"]
-                async with self._config_lock, self._dsh_update.access.write():
+                async with (
+                    self._dsh_update.access.write(),
+                    self._config_publication.read(),
+                ):
                     self._check_integration_available()
                     if action_revision != self._dsh_action_revision:
                         return await run_sync_owned(
@@ -277,19 +279,16 @@ class IntegrationService:
                         snapshot.current_settings() is not self.settings
                         or revision
                         != self.provider_manager.catalog_status()["catalog_revision"]
-                        or self.provider_manager.catalog_status()["catalog"] != "ready"
                     ):
                         continue
                     catalog = read_model_catalog(snapshot)
                     url = local_proxy_root_url(self.settings)
                     token = self.settings.proxy_auth_token
-                    timeout = self.settings.provider_progress_timeout
 
                     def operate(
                         catalog: ModelCatalog = catalog,
                         url: str = url,
                         token: str = token,
-                        timeout: float = timeout,
                     ) -> JsonObject:
                         home = dsh_desktop_integration.config_home()
                         if action == "refresh":
@@ -299,7 +298,6 @@ class IntegrationService:
                                     url,
                                     token,
                                     catalog,
-                                    provider_progress_timeout=timeout,
                                 )
                             }
                         return dsh_desktop_integration.configure(
@@ -307,7 +305,6 @@ class IntegrationService:
                             url,
                             token,
                             catalog,
-                            provider_progress_timeout=timeout,
                         )
 
                     result = await run_sync_owned(operate)
@@ -345,18 +342,20 @@ class IntegrationService:
                     return {"changed": False}
             while True:
                 snapshot = (
-                    await self.provider_manager.wait_for_catalog()
+                    self.provider_manager.catalog_snapshot()
                     if action in {"connect", "refresh"}
                     else None
                 )
                 revision = self.provider_manager.catalog_status()["catalog_revision"]
-                async with self._config_lock, self._vscode_update.access.write():
+                async with (
+                    self._vscode_update.access.write(),
+                    self._config_publication.read(),
+                ):
                     self._check_integration_available()
                     if snapshot is not None and (
                         snapshot.current_settings() is not self.settings
                         or revision
                         != self.provider_manager.catalog_status()["catalog_revision"]
-                        or self.provider_manager.catalog_status()["catalog"] != "ready"
                     ):
                         continue
                     catalog = (
@@ -407,6 +406,41 @@ class IntegrationService:
 
     async def disconnect_claude_vscode(self) -> JsonObject:
         return await self._claude_vscode("disconnect")
+
+    async def claude_onboarding_status(self) -> JsonObject:
+        return await self._claude_onboarding(complete=False)
+
+    async def complete_claude_onboarding(self) -> JsonObject:
+        return await self._claude_onboarding(complete=True)
+
+    async def _claude_onboarding(self, *, complete: bool) -> JsonObject:
+        def operate() -> JsonObject:
+            operation = (
+                claude_onboarding.complete if complete else claude_onboarding.status
+            )
+            return operation(claude_onboarding.state_path())
+
+        try:
+            if complete:
+                async with (
+                    self._claude_update.access.write(),
+                    self._config_publication.read(),
+                ):
+                    self._check_integration_available()
+                    return await run_sync_owned(operate)
+            async with self._claude_update.access.read():
+                self._check_integration_available()
+                result = await run_sync_owned(operate)
+                self._check_integration_available()
+                return result
+        except ValueError, UnicodeError:
+            raise InvalidRequestError(
+                "Could not read Claude onboarding state. Check the JSON in .claude.json."
+            ) from None
+        except OSError:
+            raise ApplicationUnavailableError(
+                "Could not access .claude.json. Check file permissions and try again."
+            ) from None
 
     def _check_integration_available(self) -> None:
         if self._is_draining() or self._has_pending_restart():
@@ -461,7 +495,7 @@ class IntegrationService:
             return await self._read_status(
                 update, operation, mask_when_unready=mask_when_unready
             )
-        async with self._config_lock, update.access.write():
+        async with update.access.write(), self._config_publication.read():
             self._check_integration_available()
             url = local_proxy_root_url(self.settings)
             token = self.settings.proxy_auth_token
@@ -608,40 +642,55 @@ class IntegrationService:
     async def _claude_vscode(self, action: IntegrationAction) -> JsonObject:
         def operate(url: str, token: str, ready: bool) -> JsonObject:
             path = claude_integration.settings_path()
-            state_path = claude_integration.claude_state_path()
             if action == "status" and not ready:
                 return {
                     "connected": None,
                     "paths": {
                         "vscode_settings": str(path.resolve()),
-                        "claude_state": str(state_path.resolve()),
+                        "claude_state": str(claude_onboarding.state_path().absolute()),
                     },
                 }
             if action == "refresh":
                 return {
-                    "changed": claude_integration.refresh_connected(
-                        path, state_path, url, token
-                    )
+                    "changed": claude_integration.refresh_connected(path, url, token)
                 }
-            return claude_integration.configure(
+            if action == "connect":
+                claude_integration.configure(path, url, token)
+                claude_onboarding.complete(claude_onboarding.state_path())
+            result = claude_integration.configure(
                 path,
-                state_path,
                 url,
                 token,
                 None if action == "status" else action == "connect",
             )
+            if action == "status":
+                result["paths"] = {
+                    "vscode_settings": str(path.resolve()),
+                    "claude_state": str(claude_onboarding.state_path().absolute()),
+                }
+            return result
 
         try:
             return await self._run_integration(
                 self._claude_update, action, operate, mask_when_unready=True
             )
         except ValueError, UnicodeError:
+            files = (
+                "VS Code settings.json and .claude.json"
+                if action == "connect"
+                else "VS Code settings.json"
+            )
             raise InvalidRequestError(
-                "Could not read Claude integration settings. Check the JSON in VS Code settings.json and .claude.json."
+                f"Could not read Claude integration settings. Check the JSON in {files}."
             ) from None
         except OSError:
+            files = (
+                "VS Code settings.json or .claude.json"
+                if action == "connect"
+                else "VS Code settings.json"
+            )
             raise ApplicationUnavailableError(
-                "Could not access VS Code settings.json or .claude.json. Check file permissions and try again."
+                f"Could not access {files}. Check file permissions and try again."
             ) from None
 
     async def codex_integration_status(self) -> JsonObject:
@@ -685,16 +734,22 @@ class IntegrationService:
                 if not existing["connected"]:
                     return {"changed": False}
             while True:
-                generation_id = (
+                catalog_version = (
                     await self.provider_manager.wait_for_catalog_file(wait)
                     if needs_catalog
                     else None
                 )
-                async with self._config_lock, self._codex_update.access.write():
+                async with (
+                    self._codex_update.access.write(),
+                    self._config_publication.read(),
+                ):
                     self._check_integration_available()
                     if needs_catalog and (
-                        generation_id != self.provider_manager.current_generation_id
-                        or self.provider_manager.catalog_status()["catalog"] != "ready"
+                        catalog_version
+                        != (
+                            self.provider_manager.current_generation_id,
+                            self.provider_manager.catalog_status()["catalog_revision"],
+                        )
                     ):
                         continue
                     url = local_proxy_root_url(self.settings)

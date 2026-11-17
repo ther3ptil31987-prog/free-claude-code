@@ -1,5 +1,6 @@
 """One-time consolidation of legacy FCC dotenv state."""
 
+import json
 import os
 import re
 import uuid
@@ -9,6 +10,11 @@ from pathlib import Path
 
 from loguru import logger
 
+from .api_keys import api_key_values, encode_api_keys, normalize_api_keys
+from .custom_providers import (
+    CUSTOM_PROVIDERS_ENV,
+    decode_custom_providers,
+)
 from .env_files import (
     ANTHROPIC_AUTH_TOKEN_ENV,
     FCC_CONFIG_SCHEMA_ENV,
@@ -23,7 +29,7 @@ from .paths import legacy_env_paths, managed_env_path
 from .provider_catalog import PROVIDER_CATALOG
 from .settings import Settings
 
-CONFIG_SCHEMA_VERSION = "1"
+CONFIG_SCHEMA_VERSION = "2"
 LEGACY_HUGGINGFACE_TOKEN_ENV = "HF_TOKEN"
 HUGGINGFACE_API_KEY_ENV = "HUGGINGFACE_API_KEY"
 LEGACY_OPENCODE_PROXY_ENV = "OPENCODE_PROXY"
@@ -134,8 +140,6 @@ def settings_env_keys() -> frozenset[str]:
 
     keys: set[str] = set()
     for name, field in Settings.model_fields.items():
-        if name == "nim":
-            continue
         alias = field.validation_alias
         if not isinstance(alias, str):
             raise AssertionError(f"Settings field {name!r} needs one string alias")
@@ -174,6 +178,11 @@ def secret_env_keys() -> frozenset[str]:
         if name.endswith(("_api_key", "_proxy", "_token"))
     }
     secret_attrs.update({"telegram_proxy_url", "proxy_auth_token", "custom_providers"})
+    secret_attrs.update(
+        descriptor.credential_attr
+        for descriptor in PROVIDER_CATALOG.values()
+        if descriptor.credential_attr is not None
+    )
     return frozenset(
         str(Settings.model_fields[name].validation_alias) for name in secret_attrs
     )
@@ -201,6 +210,15 @@ def consolidate_managed_config(
                 return ConfigMigrationResult(changed=False)
             atomic_write_managed_config(normalized, path=managed)
             _log_model_repairs(base_values, normalized)
+            return ConfigMigrationResult(changed=True)
+        if schema == "1":
+            repaired = normalize_retired_model_settings(
+                base_values, preserve_empty_overrides=False
+            )
+            normalized = _normalize_credential_lists(repaired, process)
+            normalized[FCC_CONFIG_SCHEMA_ENV] = CONFIG_SCHEMA_VERSION
+            atomic_write_managed_config(normalized, path=managed)
+            _log_model_repairs(base_values, repaired)
             return ConfigMigrationResult(changed=True)
         if schema not in {None, ""}:
             raise ValueError(
@@ -235,19 +253,63 @@ def consolidate_managed_config(
         if key in known and key != FCC_CONFIG_SCHEMA_ENV and not values[key].strip():
             values.pop(key)
     values[FCC_CONFIG_SCHEMA_ENV] = CONFIG_SCHEMA_VERSION
-    normalized = normalize_retired_model_settings(
-        values, preserve_empty_overrides=False
+    normalized = _normalize_credential_lists(
+        normalize_retired_model_settings(values, preserve_empty_overrides=False),
+        process,
     )
     atomic_write_managed_config(normalized, path=managed)
     _log_model_repairs(values, normalized)
     return ConfigMigrationResult(changed=True, imported_from=tuple(imported))
 
 
+def _normalize_credential_lists(
+    values: Mapping[str, str], process: Mapping[str, str]
+) -> dict[str, str]:
+    normalized = dict(values)
+    owners = {
+        descriptor.credential_env
+        for descriptor in PROVIDER_CATALOG.values()
+        if descriptor.credential_env is not None
+    }
+    for key in owners & normalized.keys():
+        try:
+            encoded = encode_api_keys(normalize_api_keys(normalized[key]))
+        except ValueError as exc:
+            if key in process:
+                continue
+            raise ValueError(f"{key}: {exc}") from None
+        if encoded is None:
+            normalized.pop(key)
+        else:
+            normalized[key] = encoded
+    if CUSTOM_PROVIDERS_ENV in normalized:
+        try:
+            decoded = decode_custom_providers(normalized[CUSTOM_PROVIDERS_ENV])
+            if not isinstance(decoded, list):
+                raise ValueError("Custom providers must be a JSON array")
+            for definition in decoded:
+                if not isinstance(definition, dict):
+                    continue
+                if "api_key" in definition and "api_keys" in definition:
+                    continue  # Effective Settings validation rejects this conflict.
+                member = "api_key" if "api_key" in definition else "api_keys"
+                if member in definition:
+                    keys = api_key_values(normalize_api_keys(definition.pop(member)))
+                    definition["api_keys"] = keys
+            normalized[CUSTOM_PROVIDERS_ENV] = json.dumps(
+                decoded, ensure_ascii=False, separators=(",", ":")
+            )
+        except ValueError:
+            if CUSTOM_PROVIDERS_ENV not in process:
+                raise
+    return normalized
+
+
 def _log_model_repairs(before: Mapping[str, str], after: Mapping[str, str]) -> None:
     changed = sorted(key for key in before if before[key] != after.get(key))
     if changed:
         logger.info(
-            "Repaired retired provider selections in managed config: {}",
+            "Repaired retired model selections in managed config: {}",
             ", ".join(changed),
         )
 

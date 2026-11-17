@@ -8,6 +8,7 @@ from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
 from free_claude_code.providers.openai_chat import (
     NO_REASONING,
@@ -21,8 +22,18 @@ from tests.providers.support import immediate_admission, make_provider_config
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("prefix", ["", "anthropic/", "claude-3-freecc-no-thinking/"])
-def test_retired_model_ingress_calls_default_provider(client, stream, prefix):
-    original = f"{prefix}github_models/vendor/opus"
+@pytest.mark.parametrize(
+    "ref,upstream",
+    [
+        ("github_models/vendor/opus", DEFAULT_MODEL.split("/", 1)[1]),
+        (
+            "nvidia_nim/nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+        ),
+    ],
+)
+def test_retired_model_ingress_calls_replacement(client, stream, prefix, ref, upstream):
+    original = f"{prefix}{ref}"
     _stream_messages_calls.clear()
     response = client.post(
         "/v1/messages",
@@ -36,7 +47,7 @@ def test_retired_model_ingress_calls_default_provider(client, stream, prefix):
     assert response.status_code == 200
     assert len(_stream_messages_calls) == 1
     args, kwargs = _stream_messages_calls[0]
-    assert args[0].model == DEFAULT_MODEL.split("/", 1)[1]
+    assert args[0].model == upstream
     assert kwargs["response_model"] == original
     if prefix == "claude-3-freecc-no-thinking/":
         assert kwargs["reasoning"] == ReasoningPolicy.off()
@@ -57,8 +68,16 @@ _stream_messages_calls: list = []
 async def _mock_stream_messages(*args, **kwargs):
     """Minimal async generator for streaming tests."""
     _stream_messages_calls.append((args, kwargs))
-    yield "event: message_start\ndata: {}\n\n"
-    yield "[DONE]\n\n"
+    yield StreamOutput(
+        (
+            'event: message_start\ndata: {"type":"message_start","message":{"type":"message","id":"m","role":"assistant","content":[],"model":"test"}}\n\n',
+        )
+    )
+    yield StreamOutput(
+        (
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+        )
+    )
 
 
 async def _mock_pre_start_rate_limit(*args, **kwargs):
@@ -70,14 +89,23 @@ async def _mock_pre_start_rate_limit(*args, **kwargs):
         message="upstream is busy",
         retryable=True,
     )
-    yield "unreachable"
+    yield StreamOutput(("unreachable",))
 
 
 async def _mock_empty_stream(*args, **kwargs):
     """Provider stream that completes without a protocol frame."""
     _stream_messages_calls.append((args, kwargs))
     if False:
-        yield "unreachable"
+        yield StreamOutput(("unreachable",))
+
+
+def _invalid_request_error(response):
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["type"] == "error"
+    assert payload["request_id"] == response.headers["request-id"]
+    assert payload["error"]["type"] == "invalid_request_error"
+    return payload["error"]
 
 
 def _terminal_json_error(response, *, status_code: int):
@@ -126,7 +154,7 @@ def test_models_list(client: TestClient):
     data = response.json()
     assert data["has_more"] is False
     ids = [item["id"] for item in data["data"]]
-    assert "claude-sonnet-4-20250514" in ids
+    assert "claude-sonnet-5-5" in ids
     assert data["first_id"] == ids[0]
     assert data["last_id"] == ids[-1]
     assert response.headers["x-request-id"] == response.headers["request-id"]
@@ -222,7 +250,7 @@ def test_create_message_rejects_unportable_image_as_invalid_request() -> None:
             profile=OpenAIChatProfile(
                 OpenAIChatRequestPolicy(
                     provider_name="TEST_CHAT",
-                    reasoning_replay=ReasoningReplayMode.DISABLED,
+                    reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
                 ),
                 NO_REASONING,
             ),
@@ -321,32 +349,88 @@ def test_create_message_pre_start_provider_error_returns_terminal_json(
     mock_provider.stream_messages = _mock_stream_messages
 
 
-def test_create_message_preserves_system_role_messages(client: TestClient):
-    """Create message preserves latest-client system message placement."""
-    mock_provider.stream_messages = _mock_stream_messages
+@pytest.mark.parametrize(
+    "system_turn",
+    [
+        {"role": "system", "content": "system prompt"},
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "reminder"}],
+            "clear_at": "next_user_message",
+        },
+    ],
+    ids=["text", "clear-at"],
+)
+@pytest.mark.parametrize("leading", [True, False], ids=["leading", "mid"])
+def test_system_role_messages_are_rejected(client: TestClient, system_turn, leading):
+    """System prompts belong in ``system``; Claude Code retries without the turn."""
     _stream_messages_calls.clear()
-    payload = {
-        "model": "claude-3-sonnet",
-        "messages": [
-            {"role": "user", "content": "context"},
-            {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "Hi"},
-        ],
-        "max_tokens": 100,
-        "stream": True,
-    }
+    messages = [{"role": "user", "content": "Hi"}]
+    messages.insert(0 if leading else 1, system_turn)
+    if not leading:
+        messages.append({"role": "user", "content": "again"})
 
-    response = client.post("/v1/messages", json=payload)
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-3-sonnet",
+            "messages": messages,
+            "max_tokens": 100,
+            "stream": True,
+        },
+    )
 
-    assert response.status_code == 200
-    routed_request = _stream_messages_calls[0][0][0]
-    assert [message.role for message in routed_request.messages] == [
-        "user",
-        "system",
-        "user",
-    ]
-    assert routed_request.messages[1].content == "system prompt"
-    assert routed_request.system is None
+    error = _invalid_request_error(response)
+    assert "top-level `system` field" in error["message"]
+    assert "run `claude update`" in error["message"]
+    assert error["details"] == {"error_code": "mid_conversation_system_not_supported"}
+    assert _stream_messages_calls == []
+
+
+def test_system_role_rejection_names_the_claude_code_version(client: TestClient):
+    _stream_messages_calls.clear()
+    response = client.post(
+        "/v1/messages",
+        headers={"User-Agent": "claude-cli/2.1.288 (external, cli)"},
+        json={
+            "model": "claude-3-sonnet",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "reminder"},
+            ],
+            "max_tokens": 100,
+        },
+    )
+
+    error = _invalid_request_error(response)
+    assert error["message"] == (
+        "Claude Code 2.1.288 sent a system message inside `messages`, which "
+        "Free Claude Code can't accept. Run `claude update`, then restart "
+        "Claude Code."
+    )
+    assert error["details"] == {"error_code": "mid_conversation_system_not_supported"}
+    assert _stream_messages_calls == []
+
+
+def test_count_tokens_rejects_system_role_messages_with_update_hint(
+    client: TestClient,
+):
+    response = client.post(
+        "/v1/messages/count_tokens",
+        headers={"User-Agent": "claude-cli/2.1.288 (external, cli)"},
+        json={
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "reminder"},
+                {"role": "user", "content": "Hello"},
+            ],
+        },
+    )
+
+    error = _invalid_request_error(response)
+    assert "Claude Code 2.1.288" in error["message"]
+    assert "Run `claude update`" in error["message"]
+    assert error["details"] == {"error_code": "mid_conversation_system_not_supported"}
 
 
 def test_model_mapping(client: TestClient):
