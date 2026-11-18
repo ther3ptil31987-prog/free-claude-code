@@ -18,6 +18,9 @@ from .check_version_policy import (
     release_paths,
 )
 
+# Reserve the version of the unpublished Windows signing draft.
+WITHDRAWN_RELEASE = ("v6.19.38", "fda456aea40f7d3297003fafc710460afbb27cea")
+
 
 def command(args: list[str], *, cwd: Path | None = None) -> str:
     return subprocess.run(
@@ -65,6 +68,9 @@ class Publisher:
         history = git("rev-list", "--first-parent", "origin/main").splitlines()
         if target not in history:
             raise ValueError("Release target is not on main's first-parent history")
+        withdrawn_tag, withdrawn_commit = WITHDRAWN_RELEASE
+        if target == withdrawn_commit:
+            raise ValueError(f"Release {withdrawn_tag} was withdrawn")
         title = git("show", "-s", "--format=%s", target)
         kind = release_kind(title, changed_paths(f"{target}^", target))
         if kind is None:
@@ -94,7 +100,12 @@ class Publisher:
             raise ValueError("No baseline release tag found")
         releases = self.releases()
         predecessor = releases.get(previous)
-        if not predecessor or predecessor["draft"] or predecessor["prerelease"]:
+        withdrawn_predecessor = (previous, tags[previous]) == WITHDRAWN_RELEASE
+        if (
+            not predecessor
+            or predecessor["prerelease"]
+            or (predecessor["draft"] and not withdrawn_predecessor)
+        ):
             raise ValueError(
                 f"Earlier release {previous} is unfinished; retry its post-merge run"
             )

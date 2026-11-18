@@ -293,6 +293,31 @@ def test_later_commit_waits_for_draft_and_old_retry_is_noop(releases):
     assert not any(c[:3] == ["gh", "release", "edit"] for c in remote.calls[calls:])
 
 
+def test_publish_after_withdrawn_draft_and_reject_its_retry(releases, monkeypatch):
+    repo, remote = releases
+    withdrawn = remote.advance("patch: Withdrawn change")
+    git(repo, "tag", "v1.2.4", withdrawn)
+    remote.releases["v1.2.4"] = {
+        "id": 2,
+        "tag_name": "v1.2.4",
+        "draft": True,
+        "prerelease": False,
+        "assets": [],
+    }
+    monkeypatch.setattr(publishing, "WITHDRAWN_RELEASE", ("v1.2.4", withdrawn))
+    restored = remote.advance("patch: Restore publishing")
+
+    remote.publisher().publish(restored)
+    assert git(repo, "rev-parse", "v1.2.5") == restored
+    assert not remote.releases["v1.2.5"]["draft"]
+
+    with pytest.raises(ValueError, match="was withdrawn"):
+        remote.publisher().publish(withdrawn)
+    assert git(repo, "rev-parse", "v1.2.4") == withdrawn
+    assert remote.releases["v1.2.4"]["draft"]
+    assert set(remote.uploaded) == set(publishing.distribution_names("1.2.5"))
+
+
 def test_tag_collision_and_extra_target_tag_are_rejected(releases):
     repo, remote = releases
     head = remote.advance()
